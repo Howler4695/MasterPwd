@@ -1,5 +1,5 @@
 //! Command-line parsing compatible with the reference `getopt` string
-//! `u:U:m:M:t:P:c:a:p:C:f:F:R:vqh`.
+//! `u:U:m:M:t:P:c:a:p:C:f:F:R:vqh`, plus `k:` (recovery code fd).
 //!
 //! Differences from the reference (all deliberate):
 //! * `-M master-password` is refused: secrets on the command line leak via
@@ -19,6 +19,8 @@ pub struct Arguments {
     /// `-U`: allow updating the master password in the user file.
     pub allow_password_update: bool,
     pub master_password_fd: Option<String>,
+    /// `-k fd`: read a second-factor user's recovery code from this descriptor.
+    pub recovery_code_fd: Option<String>,
     pub site_name: Option<String>,
     pub result_type: Option<String>,
     pub result_param: Option<String>,
@@ -64,7 +66,8 @@ pub fn parse(argv: impl IntoIterator<Item = OsString>) -> Result<Arguments, Fata
                 'v' => args.verbosity += 1,
                 'q' => args.verbosity -= 1,
                 'h' => args.help = true,
-                'u' | 'U' | 'm' | 'M' | 't' | 'P' | 'c' | 'a' | 'p' | 'C' | 'f' | 'F' | 'R' => {
+                'u' | 'U' | 'm' | 'k' | 'M' | 't' | 'P' | 'c' | 'a' | 'p' | 'C' | 'f' | 'F'
+                | 'R' => {
                     // The value is the rest of this argument, or the next one.
                     let rest = &cluster[i + opt.len_utf8()..];
                     let value = if rest.is_empty() {
@@ -106,6 +109,7 @@ fn apply(args: &mut Arguments, opt: char, value: Option<String>) -> Result<(), F
             args.allow_password_update = opt == 'U';
         }
         'm' => args.master_password_fd = value,
+        'k' => args.recovery_code_fd = value,
         'M' => {
             // Never accept a secret as an argument: it is visible to every
             // user via `ps` and is kept in shell history.  We cannot scrub it
@@ -137,7 +141,7 @@ fn missing_value(opt: char) -> Fatal {
         'u' | 'U' => "full name",
         't' => "type name",
         'c' => "counter value",
-        'm' => "file descriptor",
+        'm' | 'k' => "file descriptor",
         'a' => "algorithm version",
         'p' => "purpose",
         'C' => "context",

@@ -4,6 +4,7 @@
 
 use crate::input;
 use crate::log::{dbg_log, inf, wrn, Fatal};
+use crate::second_factor;
 use crate::store::{self, Location};
 use crate::{EX_DATAERR, EX_SOFTWARE, EX_USAGE};
 use mpw_core::{AlgorithmVersion, Counter, KeyPurpose, ResultType, COUNTER_INITIAL};
@@ -22,6 +23,8 @@ pub struct Request {
     pub algorithm: Option<AlgorithmVersion>,
     pub result_param: Option<Zeroizing<String>>,
     pub allow_password_update: bool,
+    /// `-k fd`: the recovery code of a second-factor user.
+    pub recovery_code_fd: Option<String>,
     pub files: store::Options,
 }
 
@@ -48,10 +51,12 @@ fn data_err(context: &str) -> impl Fn(ModelError) -> Fatal + '_ {
 /// before the user file is written (the reference prints first, then saves).
 pub fn run(
     req: Request,
-    keys: &mut UserKeys,
+    typed_password: Zeroizing<String>,
     on_result: impl FnOnce(&Outcome) -> Result<(), Fatal>,
 ) -> Result<(), Fatal> {
-    let mut session = open_user(&req, keys)?;
+    let (mut session, mut keys) = open_user(&req, &typed_password)?;
+    drop(typed_password);
+    let keys = &mut keys;
     let user = &mut session.user;
     let site_name = req.site_name.as_str();
 
@@ -233,7 +238,7 @@ fn value_noun(purpose: KeyPurpose, result_type: ResultType) -> &'static str {
 
 // ----------------------------------------------------------------- cli_user
 
-fn open_user(req: &Request, keys: &mut UserKeys) -> Result<Session, Fatal> {
+fn open_user(req: &Request, typed: &Zeroizing<String>) -> Result<(Session, UserKeys), Fatal> {
     let location = if req.files.stateless() {
         None
     } else {
@@ -249,18 +254,39 @@ fn open_user(req: &Request, keys: &mut UserKeys) -> Result<Session, Fatal> {
         Some(loc) => loc.find(&req.files)?,
         None => None,
     };
+    // -F flat reads only flat files; do not let it quietly start a separate
+    // flat user next to a JSON user that has a second factor.
+    if let (Some(loc), store::Format::Flat) = (&location, req.files.save_format()) {
+        let json = store::Options {
+            format: store::Format::Json,
+            format_fixed: true,
+            redacted: None,
+        };
+        if let Some(path) = loc.find(&json)? {
+            let blocked = mpw_model::read_user_file(&path).is_ok_and(|f| {
+                f.summary().full_name == req.full_name && f.summary().second_factor.is_enabled()
+            });
+            if blocked {
+                return Err(flat_refused());
+            }
+        }
+    }
 
     let Some(path) = found else {
-        // No user file: a new user (it adopts this master key).
+        // No user file: a new user (it adopts this master key).  A
+        // second-factor user without its file can still use the combined
+        // `password CODE` form: it is just a master password then.
+        let mut keys = UserKeys::from_password(&req.full_name, typed);
         let mut user = User::new(&req.full_name).map_err(data_err("Invalid full name"))?;
-        user.authenticate(keys)
+        user.authenticate(&mut keys)
             .map_err(data_err("Couldn't derive master key"))?;
-        return Ok(Session {
+        let session = Session {
             user,
             location,
             loaded_from: None,
             file_redacted: true,
-        });
+        };
+        return Ok((session, keys));
     };
 
     let file = mpw_model::read_user_file(&path).map_err(|e| {
@@ -282,13 +308,40 @@ fn open_user(req: &Request, keys: &mut UserKeys) -> Result<Session, Fatal> {
         ));
     }
     let file_redacted = file.summary().redacted;
-    let user = match file.load(keys) {
-        Ok(user) => user,
-        Err(ModelError::WrongMasterPassword) if req.allow_password_update => {
-            update_master_password(&file, keys, &path)?
+    let status = &file.summary().second_factor;
+    let has_second_factor = status.is_enabled();
+    if has_second_factor && req.files.save_format() == store::Format::Flat {
+        // Checked before anything is derived or written.
+        return Err(flat_refused());
+    }
+
+    // The key holder: the typed password, plus the recovery code for a
+    // second-factor user (checked before any key derivation).
+    let unlock = if has_second_factor {
+        Some(second_factor::unlock(
+            typed,
+            status,
+            req.recovery_code_fd.as_deref(),
+        )?)
+    } else {
+        if req.recovery_code_fd.is_some() {
+            wrn!("This user has no second factor; -k is ignored.");
         }
+        None
+    };
+    let mut keys = match &unlock {
+        Some(u) => UserKeys::from_password_and_secret(&req.full_name, &u.typed, &u.secret),
+        None => UserKeys::from_password(&req.full_name, typed),
+    };
+
+    let user = match file.load(&mut keys) {
+        Ok(user) => user,
+        Err(ModelError::WrongMasterPassword) if req.allow_password_update => match &unlock {
+            Some(u) => update_second_factor_password(&file, &mut keys, u, &path)?,
+            None => update_master_password(&file, &mut keys, &path)?,
+        },
         Err(ModelError::WrongMasterPassword) => {
-            return Err(incorrect_password(&path));
+            return Err(incorrect_password(&path, has_second_factor));
         }
         Err(e) => {
             return Err(Fatal::new(
@@ -300,22 +353,36 @@ fn open_user(req: &Request, keys: &mut UserKeys) -> Result<Session, Fatal> {
             ))
         }
     };
-    Ok(Session {
+    let session = Session {
         user,
         location,
         loaded_from: Some(path),
         file_redacted,
-    })
+    };
+    Ok((session, keys))
 }
 
-fn incorrect_password(path: &Path) -> Fatal {
+fn flat_refused() -> Fatal {
     Fatal::new(
-        EX_DATAERR,
-        format!(
-            "Incorrect master password according to configuration:\n  {}: incorrect master password",
-            path.display()
-        ),
+        EX_USAGE,
+        "This user has a second factor, which the flat format cannot store: saving it as flat \
+         would lose the smart-card enrolment.  Use -F json (or -f).",
     )
+}
+
+fn incorrect_password(path: &Path, second_factor: bool) -> Fatal {
+    let mut message = format!(
+        "Incorrect master password according to configuration:\n  {}: incorrect master password",
+        path.display()
+    );
+    if second_factor {
+        message.push_str(&format!(
+            "\nThis user has a second factor and the recovery code was accepted, so the typed \
+             master password (without the code) is what is wrong.\nTo supply the code: {}.",
+            second_factor::HOW
+        ));
+    }
+    Fatal::new(EX_DATAERR, message)
 }
 
 /// `-U` with a master password that does not match the file: confirm the old
@@ -340,7 +407,7 @@ fn update_master_password(
             Err(e) => return Err(data_err("Couldn't load the configuration")(e)),
         }
     }
-    Err(incorrect_password(path))
+    Err(incorrect_password(path, false))
 }
 
 /// Move the user loaded with `old_keys` to `new_keys` (all or nothing).
@@ -356,6 +423,46 @@ fn rekey(mut user: User, old_keys: &mut UserKeys, new_keys: &mut UserKeys) -> Re
         })?;
     inf!("The configuration now uses the new master password.");
     Ok(user)
+}
+
+/// `-U` for a second-factor user: same recovery code, new typed password.
+fn update_second_factor_password(
+    file: &UserFile,
+    keys: &mut UserKeys,
+    unlock: &second_factor::Unlock,
+    path: &Path,
+) -> Result<User, Fatal> {
+    inf!("Given master password does not match configuration.");
+    inf!("To update the configuration with this new master password, first confirm the old master password (without the recovery code).");
+    let name = keys.full_name().to_owned();
+    for _ in 0..3 {
+        let Some(old) = input::getpass("Old master password: ")?.filter(|p| !p.is_empty()) else {
+            break;
+        };
+        let mut old_keys = UserKeys::from_password_and_secret(&name, &old, &unlock.secret);
+        let mut user = match file.load(&mut old_keys) {
+            Ok(user) => user,
+            Err(ModelError::WrongMasterPassword) => {
+                inf!("Incorrect old master password.");
+                continue;
+            }
+            Err(e) => return Err(data_err("Couldn't load the configuration")(e)),
+        };
+        let new_keys = user
+            .change_master_password_with_second_factor(&old, &unlock.typed, &unlock.secret)
+            .map_err(|e| {
+                Fatal::new(
+                    EX_DATAERR,
+                    format!("Couldn't move the user to the new master password; nothing was changed: {e}"),
+                )
+            })?;
+        *keys = new_keys;
+        inf!(
+            "The configuration now uses the new master password (the second factor is unchanged)."
+        );
+        return Ok(user);
+    }
+    Err(incorrect_password(path, true))
 }
 
 // ----------------------------------------------------------- site settings
@@ -497,6 +604,9 @@ fn save(session: &mut Session, keys: &mut UserKeys, files: &store::Options) -> R
     let format = files.save_format();
     if format == store::Format::None {
         return Ok(());
+    }
+    if format == store::Format::Flat && session.user.second_factor_status().is_enabled() {
+        return Err(flat_refused());
     }
     let revealed = files.redacted == Some(false);
     let path_hint = location.path(format.extensions().first().copied().unwrap_or(""));

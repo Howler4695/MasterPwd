@@ -165,6 +165,12 @@ pub fn get_secret_value(what: &str) -> Result<Zeroizing<String>, Fatal> {
 /// when the descriptor is empty or unreadable, after a warning, so the caller
 /// falls back to prompting like the reference.
 pub fn read_fd(fd: &str) -> Result<Option<Zeroizing<String>>, Fatal> {
+    read_fd_secret(fd, "master password")
+}
+
+/// Read a secret (`what`, for messages) from file descriptor `fd`: the whole
+/// content, up to EOF.  `None` (after a warning) when empty or unreadable.
+pub fn read_fd_secret(fd: &str, what: &str) -> Result<Option<Zeroizing<String>>, Fatal> {
     let fd: u32 = fd
         .trim()
         .parse()
@@ -172,15 +178,15 @@ pub fn read_fd(fd: &str) -> Result<Option<Zeroizing<String>>, Fatal> {
     let mut file = match File::open(format!("/dev/fd/{fd}")) {
         Ok(f) => f,
         Err(e) => {
-            wrn!("Error reading master password from FD {fd}: {e}");
+            wrn!("Error reading the {what} from FD {fd}: {e}");
             return Ok(None);
         }
     };
     match read_secret_bytes(&mut file, None) {
-        Ok(Some(bytes)) => into_secret_string(bytes, "master password").map(Some),
+        Ok(Some(bytes)) => into_secret_string(bytes, what).map(Some),
         Ok(None) => Ok(None),
         Err(e) => {
-            wrn!("Error reading master password from FD {fd}: {e}");
+            wrn!("Error reading the {what} from FD {fd}: {e}");
             Ok(None)
         }
     }

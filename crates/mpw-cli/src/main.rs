@@ -12,11 +12,11 @@ mod args;
 mod input;
 mod log;
 mod operation;
+mod second_factor;
 mod store;
 
 use log::{dbg_log, Fatal};
 use mpw_core::{identicon, AlgorithmVersion, Counter, Identicon, KeyPurpose, ResultType};
-use mpw_model::UserKeys;
 use std::io::{IsTerminal, Write};
 use zeroize::Zeroizing;
 
@@ -114,8 +114,6 @@ fn run() -> Result<(), Fatal> {
     };
 
     let identicon = identicon(&full_name, &master_password);
-    let mut keys = UserKeys::from_password(&full_name, &master_password);
-    drop(master_password);
 
     let request = operation::Request {
         full_name: full_name.clone(),
@@ -127,9 +125,10 @@ fn run() -> Result<(), Fatal> {
         algorithm,
         result_param: args.result_param.take().map(Zeroizing::new),
         allow_password_update: args.allow_password_update,
+        recovery_code_fd: args.recovery_code_fd.take(),
         files,
     };
-    operation::run(request, &mut keys, |outcome| {
+    operation::run(request, master_password, |outcome| {
         if log::enabled(log::LEVEL_INFO) {
             eprint!(
                 "{full_name}'s {} for {site_name}:\n[ {} ]: ",
@@ -236,7 +235,7 @@ fn usage() {
 
 USAGE
 
-  mpw [-u|-U full-name] [-m fd] [-t pw-type] [-P value] [-c counter]
+  mpw [-u|-U full-name] [-m fd] [-k fd] [-t pw-type] [-P value] [-c counter]
       [-a version] [-p purpose] [-C context] [-f|F format] [-R 0|1]
       [-v|-q]* [-h] [site-name]
 
@@ -253,6 +252,10 @@ USAGE
                stdin is not a terminal.
                (The reference's -M is not supported: never put a master
                password on the command line.)
+
+  -k fd        Read the recovery code of a user with a second factor from a
+               file descriptor (whole content; spaces, dashes and newlines
+               are ignored).  See SECOND FACTOR below.
 
   -t pw-type   Specify the password's template.
                Defaults to 'long' (-p a), 'name' (-p i) or 'phrase' (-p r).
@@ -317,6 +320,25 @@ USAGE
   -h           Show this help output instead of performing any operation.
 
   site-name    Name of the site for which to generate a token.
+
+SECOND FACTOR
+
+  A user can enable a second factor (e.g. a CAC/PIV smart card) in the
+  MasterPwd app; enabling, disabling, rotating it and enrolling cards is
+  done in the app only.  Such a user's master password is effectively
+  `password RECOVERY-CODE` (the code shown once when it was enabled).  This
+  command has no card support; it unlocks such a user with the recovery
+  code, given with -k fd, typed at the prompt (on a terminal), or appended
+  to the master password after one space.  The code is checked before
+  anything else, so a mistyped code is reported as such.  -U keeps the
+  second factor.  These users cannot be saved in the flat format.
+
+EXIT STATUS
+
+  0 success; 64 usage error; 65 bad input or wrong master password;
+  66 recovery code needed but not given; 67 recovery code mistyped;
+  77 recovery code valid but not this user's; 70 internal error;
+  73 user file could not be written; 74 I/O error.
 
 ENVIRONMENT
 
