@@ -11,6 +11,7 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod card;
 pub mod clipboard;
 pub mod core;
 pub mod data;
@@ -18,7 +19,9 @@ pub mod keys;
 pub mod menu;
 pub mod prefs;
 pub mod prompt;
+pub mod second_factor_flow;
 pub mod view_model;
+pub mod x509;
 
 #[cfg(target_os = "macos")]
 pub mod platform;

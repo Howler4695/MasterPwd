@@ -6,5 +6,10 @@
   No network entitlement of any kind.
 -->
 <plist version="1.0">
-<dict/>
+<dict>
+	<!-- Smart cards (CAC/PIV) as a second factor: reader access for
+	     TKSmartCardSlotManager (diagnostic) and token keychain items. -->
+	<key>com.apple.security.smartcard</key>
+	<true/>
+</dict>
 </plist>

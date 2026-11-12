@@ -82,6 +82,29 @@ pub fn derive_all(full_name: &str, master_password: &str) -> Result<(UserKeys, I
     Ok((keys, identicon(full_name, master_password)))
 }
 
+/// Like [`derive_all`] for a second-factor user: the keys derive from the
+/// effective master password (`typed + " " + recovery code`), the identicon
+/// from the typed password alone (as `mpw-model` does).
+pub fn derive_all_with_secret(
+    full_name: &str,
+    typed_password: &str,
+    secret: &mpw_model::SecondSecret,
+) -> Result<(UserKeys, Identicon), String> {
+    let effective = mpw_model::effective_master_password(typed_password, secret);
+    let (keys, _) = derive_all(full_name, &effective)?;
+    Ok((keys, identicon(full_name, typed_password)))
+}
+
+/// Turn a key holder that still knows its (effective) master password into a
+/// password-less one holding all four versions (runs scrypt: off the main
+/// thread).
+pub fn without_password(full_name: &str, mut keys: UserKeys) -> Result<UserKeys, String> {
+    for v in AlgorithmVersion::ALL {
+        keys.key_bytes(v).map_err(|e| e.to_string())?;
+    }
+    copy_keys(full_name, &mut keys).ok_or_else(|| "no keys".to_owned())
+}
+
 /// Copy a key holder (e.g. to use the session's keys for both sides of a
 /// merge).  Only versions present are copied; the copy is not authenticated.
 pub fn copy_keys(full_name: &str, keys: &mut UserKeys) -> Option<UserKeys> {

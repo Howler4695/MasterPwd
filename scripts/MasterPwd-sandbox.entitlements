@@ -10,5 +10,8 @@
 	<true/>
 	<key>com.apple.security.files.user-selected.read-write</key>
 	<true/>
+	<!-- Smart cards (CAC/PIV) as a second factor. -->
+	<key>com.apple.security.smartcard</key>
+	<true/>
 </dict>
 </plist>

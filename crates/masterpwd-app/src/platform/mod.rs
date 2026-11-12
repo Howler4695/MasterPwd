@@ -18,6 +18,7 @@ pub mod pasteboard;
 pub mod runloop;
 pub mod secure_input;
 pub mod sites_window;
+pub mod smart_card;
 pub mod smoke;
 pub mod status_item;
 pub mod system_events;

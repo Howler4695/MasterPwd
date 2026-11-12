@@ -181,6 +181,7 @@ pub(super) fn update_focus_state() {
         ("dialog_pending", busy.to_string()),
         ("error", error),
         ("last_close_reason", close_reason),
+        ("menu_open", MENU_OPEN.with(Cell::get).to_string()),
     ]);
 }
 
@@ -287,6 +288,18 @@ fn run_effect(effect: UiEffect) {
             let id = request.id;
             dispatch(|c, now| c.file_chosen(id, path, now));
         }
+        UiEffect::Work(work) => {
+            // Card unwraps (PIN prompt) and scrypt-heavy re-keying run here.
+            let id = work.id;
+            let task = work.task;
+            let spawned = std::thread::Builder::new().name("mpw-work".into()).spawn(move || {
+                let output = task();
+                main_async(move || guard("work", || dispatch(|c, now| c.work_finished(id, output, now))));
+            });
+            if spawned.is_err() {
+                eprintln!("MasterPwd: could not start a worker thread");
+            }
+        }
         UiEffect::DeviceAuth { id, reason } => {
             let done: super::local_auth::Done = Box::new(move |result| {
                 main_async(move || guard("device auth", || dispatch(|c, now| c.device_auth_finished(id, result, now))));
@@ -331,8 +344,7 @@ pub(super) fn rebuild_menu() {
 fn schedule_tick() {
     after(Duration::from_secs(1), || {
         guard("tick", || {
-            with_core(|c| c.tick(Instant::now()));
-            render();
+            dispatch(|c, now| c.tick(now));
         });
         schedule_tick();
     });
@@ -451,6 +463,12 @@ pub(super) fn control_action(tag: isize) {
     match tag {
         sw::TAG_UNLOCK | sw::TAG_CREATE => dispatch(|c, now| c.vm_event(now, |vm| vm.submit_unlock())),
         sw::TAG_QUICK_UNLOCK => dispatch(|c, _| c.quick_unlock()),
+        sw::TAG_CARD_RETRY => dispatch(|c, _| c.retry_card()),
+        sw::TAG_RECOVERY_CODE => dispatch(|c, _| c.use_recovery_code()),
+        sw::TAG_CARD_CANCEL => dispatch(|c, _| {
+            c.cancel_card();
+            Vec::new()
+        }),
         sw::TAG_CANCEL_NEW => vm_do(|vm| vm.cancel_new_user()),
         sw::TAG_AVATAR_PREV => vm_do(|vm| vm.cycle_new_avatar(-1)),
         sw::TAG_AVATAR_NEXT => vm_do(|vm| vm.cycle_new_avatar(1)),
@@ -581,11 +599,13 @@ define_class!(
         #[unsafe(method(menuWillOpen:))]
         fn menu_will_open(&self, _menu: &NSMenu) {
             MENU_OPEN.with(|m| m.set(true));
+            guard("menu open", update_focus_state);
         }
 
         #[unsafe(method(menuDidClose:))]
         fn menu_did_close(&self, _menu: &NSMenu) {
             MENU_OPEN.with(|m| m.set(false));
+            guard("menu close", update_focus_state);
             // Re-check once the chosen command (if any) has run.
             after(Duration::from_millis(400), || guard("focus check", focus_check));
         }
@@ -761,6 +781,7 @@ struct Environment {
     store: Result<Arc<dyn DataStore>, String>,
     vault: Box<dyn KeyVault>,
     auth: Box<dyn DeviceAuthenticator>,
+    cards: Arc<dyn crate::card::SmartCards>,
 }
 
 fn environment(mode: LaunchMode) -> Environment {
@@ -780,6 +801,7 @@ fn environment(mode: LaunchMode) -> Environment {
             store,
             vault: Box::new(Keychain::with_service(&smoke::keychain_service())),
             auth: Box::new(StubAuth(Ok(()))),
+            cards: smoke::software_cards(),
         };
     }
     Environment {
@@ -789,6 +811,7 @@ fn environment(mode: LaunchMode) -> Environment {
         store: DiskStore::open_default().map(|s| Arc::new(s) as Arc<dyn DataStore>).map_err(|e| e.to_string()),
         vault: Box::new(Keychain::app()),
         auth: Box::new(LocalAuth),
+        cards: Arc::new(super::smart_card::SystemCards),
     }
 }
 
@@ -822,7 +845,8 @@ fn launch(delegate: &AppDelegate) {
         quick_unlock,
         login_item::state(),
         Instant::now(),
-    );
+    )
+    .with_cards(env.cards);
 
     let retained: Retained<AppDelegate> = delegate.retain();
     let target: &AnyObject = delegate;

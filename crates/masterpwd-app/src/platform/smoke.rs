@@ -69,6 +69,18 @@ enum Step {
     ChangePassword,
     WaitChange,
     WaitNewUnlock,
+    SfEnable,
+    SfWaitEnable,
+    SfCardUnlock,
+    SfWaitCardUnlock,
+    SfCodeUnlock,
+    SfWaitCodeUnlock,
+    SfRemoval,
+    SfWaitRemovalLock,
+    SfAdd,
+    SfWaitAdd,
+    SfDisable,
+    SfWaitDisable,
     Identicon,
     WaitIdenticon,
     Done,
@@ -92,6 +104,10 @@ struct Smoke {
     files: VecDeque<Option<PathBuf>>,
     seen: Vec<String>,
     failure: Option<String>,
+    /// The recovery code shown by the last "Your recovery code" dialog.
+    recovery_code: Option<String>,
+    /// The site password before the second factor was enabled.
+    before: Option<String>,
 }
 
 thread_local! {
@@ -125,6 +141,47 @@ pub fn store_dir() -> PathBuf {
     })
 }
 
+thread_local! {
+    static CARD_PRESENCE: RefCell<Option<Arc<std::sync::atomic::AtomicBool>>> = const { RefCell::new(None) };
+}
+
+/// Ephemeral software "smart cards" (RSA-2048, P-256, P-384) for the smoke
+/// test: the same wrap/unwrap code as real cards, no hardware, no PIN.
+pub fn software_cards() -> Arc<dyn crate::card::SmartCards> {
+    match super::smart_card::SoftwareCards::generate() {
+        Ok(cards) => {
+            CARD_PRESENCE.with(|p| *p.borrow_mut() = Some(cards.presence()));
+            Arc::new(cards)
+        }
+        Err(e) => {
+            log(&format!("software cards unavailable: {e}"));
+            Arc::new(crate::card::NoCards)
+        }
+    }
+}
+
+fn set_card_present(present: bool) {
+    CARD_PRESENCE.with(|p| {
+        if let Some(p) = p.borrow().as_ref() {
+            p.store(present, std::sync::atomic::Ordering::SeqCst);
+        }
+    });
+}
+
+fn card_pulled() -> bool {
+    CARD_PRESENCE.with(|p| p.borrow().as_ref().is_some_and(|p| !p.load(std::sync::atomic::Ordering::SeqCst)))
+}
+
+/// Wait for a second-factor unlock to finish.
+fn wait_for_unlock(started: Instant) -> Result<Option<()>, String> {
+    match screen() {
+        Screen::Unlocked => Ok(Some(())),
+        _ if started.elapsed() > Duration::from_secs(15) => Err(format!("not unlocked: {}", vm_error())),
+        Screen::Unlocking => Ok(None),
+        s => Err(format!("unlock failed ({s:?}): {} / {:?}", vm_error(), with_core(|c| c.vm().view().card))),
+    }
+}
+
 pub fn keychain_service() -> String {
     format!("com.github.howler4695.masterpwd.SMOKE-THROWAWAY-{}", std::process::id())
 }
@@ -147,6 +204,9 @@ fn expect(title_contains: &'static str, button: &'static str, values: &[&str], s
 pub fn scripted_prompt(mtm: MainThreadMarker, prompt: &Prompt) -> PromptAnswer {
     let next = with_smoke(|s| {
         s.seen.push(format!("{} | {}", prompt.title, prompt.message));
+        if prompt.title == "Your recovery code" {
+            s.recovery_code = prompt.message.lines().next().map(str::to_owned);
+        }
         s.prompts.pop_front()
     })
     .flatten();
@@ -155,7 +215,9 @@ pub fn scripted_prompt(mtm: MainThreadMarker, prompt: &Prompt) -> PromptAnswer {
         return PromptAnswer::button(usize::MAX);
     };
     if !prompt.title.contains(e.title_contains) {
-        with_smoke(|s| s.failure = Some(format!("expected a {:?} dialog, got {:?}", e.title_contains, prompt.title)));
+        with_smoke(|s| {
+            s.failure = Some(format!("expected a {:?} dialog, got {:?}: {}", e.title_contains, prompt.title, prompt.message))
+        });
         return PromptAnswer::button(usize::MAX);
     }
     if !prompt.is_well_formed() {
@@ -175,7 +237,18 @@ pub fn scripted_prompt(mtm: MainThreadMarker, prompt: &Prompt) -> PromptAnswer {
             with_smoke(|s| s.failure = Some("the held dialog was answered differently".into()));
         }
     }
-    let values: Vec<&str> = e.values.iter().map(String::as_str).collect();
+    // `$CODE` / `$LAST5`: the recovery code shown earlier in this run.
+    let code = with_smoke(|s| s.recovery_code.clone()).flatten().unwrap_or_default();
+    let values: Vec<String> = e
+        .values
+        .iter()
+        .map(|v| match v.as_str() {
+            "$CODE" => code.clone(),
+            "$LAST5" => code.rsplit('-').next().unwrap_or("").to_owned(),
+            other => other.to_owned(),
+        })
+        .collect();
+    let values: Vec<&str> = values.iter().map(String::as_str).collect();
     PromptAnswer::with_values(button, &values)
 }
 
@@ -205,6 +278,8 @@ pub fn start() {
             files: VecDeque::new(),
             seen: Vec::new(),
             failure: None,
+            recovery_code: None,
+            before: None,
         })
     });
     log(&format!("launched; store {:?}; pumping the run loop", store_dir()));
@@ -453,7 +528,8 @@ fn run_step(step: Step, step_started: Instant) -> Result<Option<Step>, String> {
                 LoginItemState::Unavailable("smoke test".into()),
                 Instant::now(),
             );
-            replace_core(core);
+            let cards = with_core(|c| c.cards().clone()).ok_or("no core")?;
+            replace_core(core.with_cards(cards));
             let users = with_core(|c| c.vm().users().to_vec()).unwrap_or_default();
             check(users.len() == 1 && users[0].full_name == NAME, format!("after reload: {users:?}"))?;
             check(users[0].site_count == 1, format!("site not persisted: {users:?}"))?;
@@ -599,9 +675,174 @@ fn run_step(step: Step, step_started: Instant) -> Result<Option<Step>, String> {
             None => Ok(None),
             Some(()) => {
                 log("unlocked with the new master password after reload from disk");
-                Ok(Some(Step::Identicon))
+                Ok(Some(Step::SfEnable))
             }
         },
+        Step::SfEnable => {
+            open_window();
+            type_into(sw::TAG_SITE, SITE);
+            let before = with_core(|c| c.vm().result().map(str::to_owned)).flatten();
+            with_smoke(|s| s.before = before);
+            expect("Require a smart card", "Continue…", &[], true);
+            expect("Use this smart card", "Use This Card", &[], false);
+            expect("Your recovery code", "I Have Saved It", &[], true);
+            expect("Confirm and turn on", "Turn On Second Factor", &["$LAST5", NEW_PASSWORD], false);
+            expect("Second factor turned on", "OK", &[], false);
+            dispatch(|c, now| c.command(MenuCommand::EnableSecondFactor, now));
+            Ok(Some(Step::SfWaitEnable))
+        }
+        Step::SfWaitEnable => {
+            let enabled = with_core(|c| c.session_has_second_factor()).unwrap_or(false);
+            if !enabled || with_smoke(|s| !s.prompts.is_empty()).unwrap_or(true) {
+                return if step_started.elapsed() > Duration::from_secs(15) {
+                    Err(format!("second factor not enabled: {:?}", with_smoke(|s| s.seen.last().cloned())))
+                } else {
+                    Ok(None)
+                };
+            }
+            let code = with_smoke(|s| s.recovery_code.clone()).flatten().unwrap_or_default();
+            check(code.len() == 41 && code.matches('-').count() == 6, format!("recovery code format: {} chars", code.len()))?;
+            open_window();
+            type_into(sw::TAG_SITE, SITE);
+            let after = with_core(|c| c.vm().result().map(str::to_owned)).flatten();
+            let before = with_smoke(|s| s.before.clone()).flatten();
+            check(after.is_some() && after != before, "enabling did not change the generated password")?;
+            check(!Keychain::with_service(&keychain_service()).has_any(NAME), "saved keys not purged")?;
+            let slots = with_core(|c| c.vm().user().and_then(|u| u.second_factor_status().second_factor().map(|f| f.slots().len())))
+                .flatten();
+            check(slots == Some(1), format!("slots after enable: {slots:?}"))?;
+            log("second factor enabled with the software card (verified by one unwrap); password changed");
+            Ok(Some(Step::SfCardUnlock))
+        }
+        Step::SfCardUnlock => {
+            dispatch(|c, now| c.command(MenuCommand::Lock, now));
+            open_window();
+            let row = with_core(|c| c.vm().view().users.first().map(|u| u.second_factor)).flatten();
+            check(row == Some(true), "the user picker does not show that a card is required")?;
+            type_into(sw::TAG_MASTER_PASSWORD, NEW_PASSWORD);
+            check(text_command(sw::TAG_MASTER_PASSWORD, sel!(insertNewline:)), "⏎ not handled")?;
+            Ok(Some(Step::SfWaitCardUnlock))
+        }
+        Step::SfWaitCardUnlock => match wait_for_unlock(step_started)? {
+            None => Ok(None),
+            Some(()) => {
+                type_into(sw::TAG_SITE, SITE);
+                let r = with_core(|c| c.vm().result().map(str::to_owned)).flatten();
+                check(r.is_some() && r != with_smoke(|s| s.before.clone()).flatten(), "wrong keys after card unlock")?;
+                log("unlocked with password + software card");
+                Ok(Some(Step::SfCodeUnlock))
+            }
+        },
+        Step::SfCodeUnlock => {
+            dispatch(|c, now| c.command(MenuCommand::Lock, now));
+            set_card_present(false);
+            open_window();
+            type_into(sw::TAG_MASTER_PASSWORD, NEW_PASSWORD);
+            check(text_command(sw::TAG_MASTER_PASSWORD, sel!(insertNewline:)), "⏎ not handled")?;
+            let waiting = with_core(|c| c.vm().view().card.map(|p| p.note)).flatten().unwrap_or_default();
+            check(waiting.contains("Insert your smart card"), format!("no 'insert your card' state: {waiting:?}"))?;
+            hold_here("insert-card");
+            expect("Recovery code", "Continue", &["00000-00000-00000-00000-00000-00000-00000"], false);
+            expect("Recovery code", "Continue", &["$CODE"], false);
+            control_action(sw::TAG_RECOVERY_CODE);
+            let seen = with_smoke(|s| s.seen.last().cloned()).flatten().unwrap_or_default();
+            check(seen.contains("mistyped") || seen.contains("checksum"), format!("wrong code not rejected: {seen:?}"))?;
+            Ok(Some(Step::SfWaitCodeUnlock))
+        }
+        Step::SfWaitCodeUnlock => match wait_for_unlock(step_started)? {
+            None => Ok(None),
+            Some(()) => {
+                log("unlocked with password + recovery code (a wrong code was rejected first)");
+                Ok(Some(Step::SfRemoval))
+            }
+        },
+        Step::SfRemoval => {
+            set_card_present(true);
+            dispatch(|c, now| c.command(MenuCommand::Lock, now));
+            open_window();
+            type_into(sw::TAG_MASTER_PASSWORD, NEW_PASSWORD);
+            check(text_command(sw::TAG_MASTER_PASSWORD, sel!(insertNewline:)), "⏎ not handled")?;
+            Ok(Some(Step::SfWaitRemovalLock))
+        }
+        Step::SfWaitRemovalLock => {
+            match screen() {
+                Screen::Unlocked if !card_pulled() => {
+                    set_card_present(false);
+                    with_smoke(|s| s.polls = 0);
+                    Ok(None)
+                }
+                Screen::Unlocked => {
+                    if step_started.elapsed() > Duration::from_secs(10) {
+                        Err("not locked after the card was removed".into())
+                    } else {
+                        Ok(None)
+                    }
+                }
+                Screen::Unlocking if !card_pulled() => Ok(None),
+                Screen::Pick if card_pulled() => {
+                    log("locked when the software card was removed");
+                    set_card_present(true);
+                    Ok(Some(Step::SfAdd))
+                }
+                s => Err(format!("unexpected screen {s:?}: {}", vm_error())),
+            }
+        }
+        Step::SfAdd => {
+            open_window();
+            type_into(sw::TAG_MASTER_PASSWORD, NEW_PASSWORD);
+            check(text_command(sw::TAG_MASTER_PASSWORD, sel!(insertNewline:)), "⏎ not handled")?;
+            Ok(Some(Step::SfWaitAdd))
+        }
+        Step::SfWaitAdd => {
+            let slots = || {
+                with_core(|c| c.vm().user().and_then(|u| u.second_factor_status().second_factor().map(|f| f.slots().len())))
+                    .flatten()
+            };
+            if screen() != Screen::Unlocked {
+                return wait_for_unlock(step_started).map(|_| None);
+            }
+            if with_smoke(|s| s.prompts.is_empty() && s.recovery_code.is_some() && s.before.is_some()) == Some(true)
+                && slots() == Some(1)
+                && with_smoke(|s| !s.seen.iter().any(|m| m.starts_with("Add this smart card"))) == Some(true)
+            {
+                expect("Add this smart card", "Add This Card", &[], false);
+                dispatch(|c, now| c.command(MenuCommand::AddSmartCard, now));
+                return Ok(None);
+            }
+            match slots() {
+                Some(2) => {
+                    log("second card added (verified by one unwrap)");
+                    expect("Remove", "Remove", &[], false);
+                    dispatch(|c, now| c.command(MenuCommand::RemoveSlot(1), now));
+                    check(slots() == Some(1), "card not removed")?;
+                    log("second card removed");
+                    Ok(Some(Step::SfDisable))
+                }
+                _ if step_started.elapsed() > Duration::from_secs(15) => Err(format!("card not added: {}", vm_error())),
+                _ => Ok(None),
+            }
+        }
+        Step::SfDisable => {
+            expect("Turn off the second factor", "Turn Off…", &[NEW_PASSWORD], false);
+            expect("Second factor turned off", "OK", &[], false);
+            dispatch(|c, now| c.command(MenuCommand::DisableSecondFactor, now));
+            Ok(Some(Step::SfWaitDisable))
+        }
+        Step::SfWaitDisable => {
+            if with_core(|c| c.session_has_second_factor()).unwrap_or(true) {
+                return if step_started.elapsed() > Duration::from_secs(15) {
+                    Err(format!("not disabled: {:?}", with_smoke(|s| s.seen.last().cloned())))
+                } else {
+                    Ok(None)
+                };
+            }
+            open_window();
+            type_into(sw::TAG_SITE, SITE);
+            let r = with_core(|c| c.vm().result().map(str::to_owned)).flatten();
+            check(r.is_some() && r == with_smoke(|s| s.before.clone()).flatten(), "passwords did not change back")?;
+            log("second factor turned off; passwords are back");
+            Ok(Some(Step::Identicon))
+        }
         Step::Identicon => {
             dispatch(|c, now| c.command(MenuCommand::Lock, now));
             open_window();

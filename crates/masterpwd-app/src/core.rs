@@ -12,7 +12,11 @@ use std::time::{Duration, Instant};
 use mpw_core::Zeroizing;
 use mpw_model::{ExportMode, Format, KeyId, User, UserFile, UserKeys};
 
+use std::sync::Arc;
+
+use crate::card::{NoCards, SmartCards};
 use crate::clipboard::{ClipboardGuard, Pasteboard};
+use crate::second_factor_flow::{Goal, SfPending, SfState, Work};
 use crate::data::{capitalise, StoreError};
 use crate::keys::{copy_keys, DeriveJob, DerivePurpose, Derived, KeyVault};
 use crate::menu::{MenuCommand, MenuEntry, MenuItem, Modifiers};
@@ -38,6 +42,8 @@ pub enum UiEffect {
     /// Ask for device-owner authentication (Touch ID or the account
     /// password); answer with [`AppCore::device_auth_finished`].
     DeviceAuth { id: u64, reason: String },
+    /// Run on a worker thread; answer with [`AppCore::work_finished`].
+    Work(Work),
 }
 
 impl fmt::Debug for UiEffect {
@@ -54,6 +60,7 @@ impl fmt::Debug for UiEffect {
             Self::Prompt(p) => write!(f, "Prompt({:?})", p.title),
             Self::ChooseFile(r) => write!(f, "ChooseFile({:?})", r.title),
             Self::DeviceAuth { id, .. } => write!(f, "DeviceAuth({id})"),
+            Self::Work(w) => write!(f, "{w:?}"),
         }
     }
 }
@@ -69,6 +76,8 @@ pub enum LockReason {
     /// "Remember Password" is off and the sites window closed.
     WindowClosed,
     Quit,
+    /// The smart card that unlocked the user was removed.
+    CardRemoved,
 }
 
 impl LockReason {
@@ -120,14 +129,15 @@ struct ImportFlow {
     import_keys: Option<UserKeys>,
 }
 
-struct ExportFlow {
-    id: u64,
+pub(crate) struct ExportFlow {
+    pub(crate) id: u64,
     reveal: bool,
     /// For a revealed export: keys re-derived from the re-entered password.
     keys: Option<UserKeys>,
 }
 
-enum Pending {
+pub(crate) enum Pending {
+    Sf(SfPending),
     Ask(Ask),
     Info,
     DeleteUser(String),
@@ -146,31 +156,33 @@ enum FilePending {
 
 const STEP_EXISTING: u32 = 1;
 const STEP_IMPORT: u32 = 2;
-const STEP_EXPORT: u32 = 3;
+pub(crate) const STEP_EXPORT: u32 = 3;
 const STEP_CHANGE_CURRENT: u32 = 4;
 const STEP_CHANGE_NEW: u32 = 5;
 
 pub struct AppCore {
-    vm: SitesViewModel,
-    prefs: Preferences,
+    pub(crate) vm: SitesViewModel,
+    pub(crate) prefs: Preferences,
     prefs_store: Box<dyn PrefsStore>,
-    pasteboard: Box<dyn Pasteboard>,
-    clipboard: ClipboardGuard,
-    vault: Box<dyn KeyVault>,
+    pub(crate) pasteboard: Box<dyn Pasteboard>,
+    pub(crate) clipboard: ClipboardGuard,
+    pub(crate) vault: Box<dyn KeyVault>,
     /// Whether device-owner authentication can be used (else: why not).
     quick_unlock: Result<(), String>,
-    last_activity: Instant,
+    pub(crate) last_activity: Instant,
     window_open: bool,
     login_item: LoginItemState,
     next_id: u64,
     prompts: BTreeMap<u64, Pending>,
     files: BTreeMap<u64, FilePending>,
     import: Option<ImportFlow>,
-    export: Option<ExportFlow>,
+    pub(crate) export: Option<ExportFlow>,
     device_auth: Option<(u64, String)>,
     last_save_error: Option<String>,
     change_password: Option<ChangeFlow>,
     last_close_reason: Option<String>,
+    pub(crate) cards: Arc<dyn SmartCards>,
+    pub(crate) sf: SfState,
 }
 
 /// Change Master Password: both derivations run off the main thread.
@@ -243,6 +255,8 @@ impl AppCore {
             last_save_error: None,
             change_password: None,
             last_close_reason: None,
+            cards: Arc::new(NoCards),
+            sf: SfState::default(),
         }
     }
 
@@ -270,7 +284,29 @@ impl AppCore {
         &self.quick_unlock
     }
 
-    fn id(&mut self) -> u64 {
+    /// Use these smart cards (the platform's, or software keys in tests).
+    pub fn with_cards(mut self, cards: Arc<dyn SmartCards>) -> Self {
+        self.cards = cards;
+        self
+    }
+
+    pub fn cards(&self) -> &Arc<dyn SmartCards> {
+        &self.cards
+    }
+
+    pub(crate) fn ask_pub(&mut self, prompt: Prompt, pending: Pending) -> UiEffect {
+        self.ask(prompt, pending)
+    }
+
+    pub(crate) fn flow_derived_pub(&mut self, flow: u64, step: u32, derived: Derived) -> Vec<UiEffect> {
+        self.flow_derived(flow, step, derived)
+    }
+
+    pub(crate) fn remember_unlocked_user_pub(&mut self) {
+        self.remember_unlocked_user();
+    }
+
+    pub(crate) fn id(&mut self) -> u64 {
         self.next_id += 1;
         self.next_id
     }
@@ -285,11 +321,11 @@ impl AppCore {
         UiEffect::Prompt(Prompt { id, ..prompt })
     }
 
-    fn info(&mut self, title: impl Into<String>, message: impl Into<String>) -> UiEffect {
+    pub(crate) fn info(&mut self, title: impl Into<String>, message: impl Into<String>) -> UiEffect {
         self.ask(Prompt::info(title, message), Pending::Info)
     }
 
-    fn error_prompt(&mut self, title: impl Into<String>, message: impl Into<String>) -> UiEffect {
+    pub(crate) fn error_prompt(&mut self, title: impl Into<String>, message: impl Into<String>) -> UiEffect {
         let prompt = Prompt::new(Style::Warning, title, message).button("OK", ButtonRole::Default);
         self.ask(prompt, Pending::Info)
     }
@@ -333,6 +369,16 @@ impl AppCore {
                     let prompt = ask.prompt();
                     out.push(self.ask(prompt, Pending::Ask(ask)));
                 }
+                VmEffect::SecondFactorUnlock { name, password } => {
+                    let factor = self
+                        .vm
+                        .users()
+                        .iter()
+                        .find(|u| u.full_name == name)
+                        .map(|u| u.second_factor.second_factor().cloned());
+                    let factor = factor.flatten();
+                    out.extend(self.request_secret(name, factor, Goal::Unlock { password }));
+                }
             }
         }
         out
@@ -368,6 +414,7 @@ impl AppCore {
         self.export = None;
         self.device_auth = None;
         self.change_password = None;
+        self.sf_reset();
         self.prompts.clear();
         self.files.clear();
         if reason.clears_clipboard() {
@@ -437,7 +484,8 @@ impl AppCore {
 
     /// About once a second: clipboard timeout, idle lock, debounced saves and
     /// save errors.
-    pub fn tick(&mut self, now: Instant) {
+    pub fn tick(&mut self, now: Instant) -> Vec<UiEffect> {
+        let effects = self.sf_tick();
         self.clipboard.tick(self.pasteboard.as_mut(), now);
         if let Some(idle) = self.prefs.idle_timeout() {
             if self.vm.screen() != Screen::Pick
@@ -449,6 +497,7 @@ impl AppCore {
         }
         self.vm.tick(now);
         self.collect_save_errors();
+        effects
     }
 
     fn collect_save_errors(&mut self) {
@@ -488,6 +537,7 @@ impl AppCore {
         let Some(pending) = self.prompts.remove(&id) else { return Vec::new() };
         match pending {
             Pending::Info => Vec::new(),
+            Pending::Sf(p) => self.sf_answered(p, answer),
             Pending::Ask(ask) => {
                 self.vm.answer(ask, answer);
                 Vec::new()
@@ -528,6 +578,18 @@ impl AppCore {
                     self.import = None;
                     return Vec::new();
                 }
+                // A second-factor user (the stored one, or the file's): the
+                // password alone is not the master password.
+                let status = if step == STEP_EXISTING {
+                    self.vm.users().iter().find(|u| u.full_name == name).map(|u| u.second_factor.clone())
+                } else {
+                    self.import.as_ref().map(|f| f.file.summary().second_factor.clone())
+                };
+                if let Some(status) = status.filter(|s| s.is_enabled()) {
+                    let factor = status.second_factor().cloned();
+                    let password = Zeroizing::new(answer.value(0).to_owned());
+                    return self.request_secret(name, factor, Goal::Import { flow: flow_id, step, password });
+                }
                 let id = self.id();
                 let job = DeriveJob::new(
                     id,
@@ -559,6 +621,12 @@ impl AppCore {
                 if answer.button != 0 || answer.value(0).is_empty() {
                     self.export = None;
                     return Vec::new();
+                }
+                if self.session_has_second_factor() {
+                    let name = name.to_owned();
+                    let factor = self.vm.user().and_then(|u| u.second_factor_status().second_factor().cloned());
+                    let password = Zeroizing::new(answer.value(0).to_owned());
+                    return self.request_secret(name, factor, Goal::ExportReveal { password });
                 }
                 let (flow_id, name) = (flow.id, name.to_owned());
                 let id = self.id();
@@ -953,6 +1021,11 @@ impl AppCore {
         if let Some(problem) = problem {
             return vec![self.error_prompt("Master password not changed", problem)];
         }
+        if self.session_has_second_factor() {
+            let factor = self.vm.user().and_then(|u| u.second_factor_status().second_factor().cloned());
+            let (old, new) = (Zeroizing::new(current.to_owned()), Zeroizing::new(new.to_owned()));
+            return self.request_secret(name, factor, Goal::ChangePassword { old, new });
+        }
         let flow = self.id();
         self.change_password = Some(ChangeFlow { id: flow, current: None, new: None });
         let (a, b) = (self.id(), self.id());
@@ -1063,6 +1136,12 @@ impl AppCore {
     }
 
     fn toggle_save_password(&mut self) -> Vec<UiEffect> {
+        if self.session_has_second_factor() {
+            return vec![self.error_prompt(
+                "Save Password is off for this user",
+                "Saved keys would unlock without the smart card, defeating the second factor.",
+            )];
+        }
         if let Err(why) = &self.quick_unlock {
             let why = why.clone();
             return vec![self.error_prompt("Save Password is not available", why)];
@@ -1133,6 +1212,16 @@ impl AppCore {
             },
             MenuCommand::ShowWelcome => vec![UiEffect::ShowWelcome],
             MenuCommand::ChangeMasterPassword => self.ask_change_password(),
+            MenuCommand::EnableSecondFactor => self.sf_enable(),
+            MenuCommand::AddSmartCard => self.sf_add_card(),
+            MenuCommand::RotateRecoveryCode => self.sf_rotate(),
+            MenuCommand::DisableSecondFactor => self.sf_disable(),
+            MenuCommand::RemoveSlot(i) => self.sf_remove_slot(i as usize),
+            MenuCommand::ToggleLockOnCardRemoval => {
+                self.prefs.lock_on_card_removal = !self.prefs.lock_on_card_removal;
+                self.save_prefs();
+                Vec::new()
+            }
             MenuCommand::ToggleSavePassword => self.toggle_save_password(),
             MenuCommand::SelectUser(i) => {
                 let name = self.vm.users().get(i as usize).map(|u| u.full_name.clone());
@@ -1209,6 +1298,43 @@ impl AppCore {
         }
     }
 
+    fn second_factor_menu(&self, unlocked: bool, enabled: bool) -> MenuItem {
+        let mut items: Vec<MenuEntry> = Vec::new();
+        if !unlocked {
+            items.push(MenuItem::new("Unlock a user to manage its second factor", MenuCommand::Open).enabled(false).into());
+        } else if !enabled {
+            items.push(
+                MenuItem::new("Require Smart Card…", MenuCommand::EnableSecondFactor)
+                    .tooltip("Make a smart card (CAC/PIV) part of this user's master password.  Changes every password.")
+                    .into(),
+            );
+        } else {
+            items.push(MenuItem::new("Enrolled cards:", MenuCommand::Open).enabled(false).into());
+            let slots = self.sf_menu_slots();
+            if slots.is_empty() {
+                items.push(MenuItem::new("  none (recovery code only)", MenuCommand::Open).enabled(false).into());
+            }
+            for (title, _) in &slots {
+                items.push(MenuItem::new(format!("  {title}"), MenuCommand::Open).enabled(false).into());
+            }
+            items.push(MenuEntry::Separator);
+            items.push(MenuItem::new("Add Smart Card…", MenuCommand::AddSmartCard).into());
+            for (i, (title, _)) in slots.iter().enumerate() {
+                let short = title.split(" — ").next().unwrap_or(title);
+                items.push(MenuItem::new(format!("Remove “{short}” #{}…", i + 1), MenuCommand::RemoveSlot(i as u32)).into());
+            }
+            items.push(MenuItem::new("New Recovery Code…", MenuCommand::RotateRecoveryCode).into());
+            items.push(MenuItem::new("Turn Off Second Factor…", MenuCommand::DisableSecondFactor).into());
+        }
+        items.push(MenuEntry::Separator);
+        items.push(
+            MenuItem::new("Lock When Smart Card Is Removed", MenuCommand::ToggleLockOnCardRemoval)
+                .checked(self.prefs.lock_on_card_removal)
+                .into(),
+        );
+        MenuItem::submenu("Second Factor", items)
+    }
+
     /// The status menu, modelled on the original `MainMenu.xib`.
     pub fn menu(&self) -> Vec<MenuEntry> {
         let ctrl_cmd = Modifiers { command: true, control: true, option: false };
@@ -1255,7 +1381,11 @@ impl AppCore {
         open_at_login.tooltip = login_tip.or_else(|| Some("Open Master Password when you log in.".into()));
 
         let save_checked = self.vm.user().is_some_and(|u| u.preferences.biometric_lock);
+        let second_factor_on = self.session_has_second_factor();
         let save_password = match (&self.quick_unlock, unlocked) {
+            _ if second_factor_on => MenuItem::new("Save Password in Keychain", MenuCommand::ToggleSavePassword)
+                .enabled(false)
+                .tooltip("Unavailable while a smart card is required: saved keys would bypass the card."),
             (Err(why), _) => MenuItem::new("Save Password in Keychain", MenuCommand::ToggleSavePassword)
                 .enabled(false)
                 .tooltip(why.clone()),
@@ -1340,6 +1470,7 @@ impl AppCore {
             delete.into(),
             MenuEntry::Separator,
             preferences.into(),
+            self.second_factor_menu(unlocked.is_some(), second_factor_on).into(),
             export.into(),
             MenuItem::new("Import Sites…", MenuCommand::ImportSites).into(),
         ];
@@ -1425,6 +1556,11 @@ mod tests {
             match e {
                 UiEffect::Derive(job) => {
                     let more = r.core.derive_finished(job.run(), r.now);
+                    out.extend(settle(r, more));
+                }
+                UiEffect::Work(work) => {
+                    let output = (work.task)();
+                    let more = r.core.work_finished(work.id, output, r.now);
                     out.extend(settle(r, more));
                 }
                 other => out.push(other),
@@ -1829,6 +1965,190 @@ mod tests {
         r.core.window_did_show(r.now);
         r.core.app_did_resign_active();
         assert_eq!(r.core.last_close_reason(), Some("keyboard focus moved to another app"));
+    }
+
+    #[cfg(target_os = "macos")]
+    mod second_factor {
+        use super::*;
+        use crate::platform::smart_card::SoftwareCards;
+
+        fn rig_with_cards() -> (Rig, Arc<SoftwareCards>) {
+            let mut r = rig(remember());
+            let cards = Arc::new(SoftwareCards::generate().unwrap());
+            let core = std::mem::replace(
+                &mut r.core,
+                AppCore::new(
+                    SitesViewModel::new(SaveQueue::inline(r.store.clone())),
+                    Box::new(MemoryPrefs::default()),
+                    Box::new(r.pb.clone()),
+                    Box::new(MemoryVault::default()),
+                    Ok(()),
+                    LoginItemState::Disabled,
+                    r.now,
+                ),
+            );
+            r.core = core.with_cards(cards.clone());
+            (r, cards)
+        }
+
+        /// Answer prompts in order; returns the recovery code seen.
+        fn run_script(r: &mut Rig, mut effects: Vec<UiEffect>, script: &[(&str, &str, &[&str])]) -> Option<String> {
+            let mut code = None;
+            for (title, button, values) in script {
+                let settled = settle(r, std::mem::take(&mut effects));
+                if !settled.iter().any(|e| matches!(e, UiEffect::Prompt(_))) {
+                    panic!("no {title:?} dialog; error: {:?}, notice: {:?}", r.core.vm().error(), r.core.vm().view().notice);
+                }
+                let p = take_prompt(settled);
+                assert!(p.title.contains(title), "expected {title:?}, got {:?}: {}", p.title, p.message);
+                if p.title == "Your recovery code" {
+                    code = p.message.lines().next().map(str::to_owned);
+                }
+                let c = code.clone().unwrap_or_default();
+                let last5 = c.rsplit('-').next().unwrap_or("").to_owned();
+                let values: Vec<&str> =
+                    values.iter().map(|v| match *v { "$CODE" => c.as_str(), "$LAST5" => last5.as_str(), v => v }).collect();
+                let i = p.button_index(button).unwrap_or_else(|| panic!("no {button} in {p:?}"));
+                effects = r.core.prompt_answered(p.id, PromptAnswer::with_values(i, &values), r.now);
+            }
+            settle(r, effects);
+            code
+        }
+
+        fn enable(r: &mut Rig) -> String {
+            let effects = r.core.command(MenuCommand::EnableSecondFactor, r.now);
+            run_script(
+                r,
+                effects,
+                &[
+                    ("Require a smart card", "Continue…", &[]),
+                    ("Use this smart card", "Use This Card", &[]),
+                    ("Your recovery code", "I Have Saved It", &[]),
+                    ("Confirm and turn on", "Turn On Second Factor", &["$LAST5", PASSWORD]),
+                    ("Second factor turned on", "OK", &[]),
+                ],
+            )
+            .unwrap()
+        }
+
+        fn unlock_2f(r: &mut Rig) -> Vec<UiEffect> {
+            let effects = r.core.vm_event(r.now, |vm| {
+                vm.pick_user(Some(NAME));
+                vm.set_master_password(pw(PASSWORD));
+                vm.submit_unlock()
+            });
+            settle(r, effects)
+        }
+
+        #[test]
+        fn enable_unlock_with_card_or_code_and_disable() {
+            let (mut r, cards) = rig_with_cards();
+            create(&mut r, NAME, PASSWORD);
+            r.core.command(MenuCommand::ToggleSavePassword, r.now);
+            copy_site(&mut r);
+            let before = r.core.vm().result().unwrap().to_owned();
+            let code = enable(&mut r);
+            assert_eq!(code.len(), 41);
+            assert!(r.core.vault.load_all(NAME).unwrap().is_none(), "saved keys purged");
+            assert!(!find(&r.core.menu(), MenuCommand::ToggleSavePassword).unwrap().enabled);
+            copy_site(&mut r);
+            assert_ne!(r.core.vm().result().unwrap(), before, "every password changes");
+
+            // Card unlock.
+            r.core.command(MenuCommand::Lock, r.now);
+            assert!(r.core.vm().view().users[0].second_factor);
+            unlock_2f(&mut r);
+            assert!(r.core.vm().is_unlocked(), "{:?}", r.core.vm().error());
+
+            // Card removed while unlocked: locks.
+            cards.set_present(false);
+            r.core.tick(r.now);
+            assert!(!r.core.vm().is_unlocked());
+
+            // No card: wait, then recovery code (a wrong one first).
+            unlock_2f(&mut r);
+            assert!(r.core.vm().view().card.unwrap().note.contains("Insert your smart card"));
+            let effects = r.core.use_recovery_code();
+            run_script(
+                &mut r,
+                effects,
+                &[("Recovery code", "Continue", &["00000-00000-00000-00000-00000-00000-00000"]), ("Recovery code", "Continue", &[code.as_str()])],
+            );
+            assert!(r.core.vm().is_unlocked(), "{:?}", r.core.vm().error());
+
+            // Wrong typed password with the right card.
+            r.core.command(MenuCommand::Lock, r.now);
+            cards.set_present(true);
+            let effects = r.core.vm_event(r.now, |vm| {
+                vm.pick_user(Some(NAME));
+                vm.set_master_password(pw("wrong"));
+                vm.submit_unlock()
+            });
+            settle(&mut r, effects);
+            assert!(!r.core.vm().is_unlocked());
+            assert!(r.core.vm().error().unwrap().contains("second factor was accepted"), "{:?}", r.core.vm().error());
+
+            // Disable: passwords come back.
+            unlock_2f(&mut r);
+            let effects = r.core.command(MenuCommand::DisableSecondFactor, r.now);
+            run_script(
+                &mut r,
+                effects,
+                &[("Turn off the second factor", "Turn Off…", &[PASSWORD]), ("Second factor turned off", "OK", &[])],
+            );
+            copy_site(&mut r);
+            assert_eq!(r.core.vm().result().unwrap(), before);
+            assert!(!r.core.session_has_second_factor());
+        }
+
+        #[test]
+        fn rotate_and_change_password_keep_working() {
+            let (mut r, cards) = rig_with_cards();
+            create(&mut r, NAME, PASSWORD);
+            let old_code = enable(&mut r);
+            let effects = r.core.command(MenuCommand::RotateRecoveryCode, r.now);
+            let new_code = run_script(
+                &mut r,
+                effects,
+                &[
+                    ("Replace the recovery code", "Continue…", &[]),
+                    ("Your recovery code", "I Have Saved It", &[]),
+                    ("Confirm the new recovery code", "Replace Recovery Code", &["$LAST5", PASSWORD]),
+                    ("New recovery code", "OK", &[]),
+                ],
+            )
+            .unwrap();
+            assert_ne!(new_code, old_code);
+            // The inserted card was re-enrolled; the old code no longer matches.
+            r.core.command(MenuCommand::Lock, r.now);
+            cards.set_present(false);
+            unlock_2f(&mut r);
+            let effects = r.core.use_recovery_code();
+            let p = take_prompt(settle(&mut r, effects));
+            let effects = r.core.prompt_answered(p.id, PromptAnswer::with_values(0, &[old_code.as_str()]), r.now);
+            settle(&mut r, effects);
+            assert!(!r.core.vm().is_unlocked());
+            let note = r.core.vm().view().card.unwrap().note;
+            assert!(note.contains("not this user's current second factor"), "{note}");
+            r.core.cancel_card();
+            cards.set_present(true);
+            unlock_2f(&mut r);
+            assert!(r.core.vm().is_unlocked(), "card re-enrolled by the rotation: {:?}", r.core.vm().error());
+
+            // Change Master Password for a second-factor user.
+            let p = take_prompt(r.core.command(MenuCommand::ChangeMasterPassword, r.now));
+            let effects = r.core.prompt_answered(p.id, PromptAnswer::with_values(1, &[PASSWORD, "newer", "newer"]), r.now);
+            let done = take_prompt(settle(&mut r, effects));
+            assert!(done.title.contains("Master password changed"), "{done:?}");
+            r.core.command(MenuCommand::Lock, r.now);
+            let effects = r.core.vm_event(r.now, |vm| {
+                vm.pick_user(Some(NAME));
+                vm.set_master_password(pw("newer"));
+                vm.submit_unlock()
+            });
+            settle(&mut r, effects);
+            assert!(r.core.vm().is_unlocked(), "{:?}", r.core.vm().error());
+        }
     }
 
     #[test]

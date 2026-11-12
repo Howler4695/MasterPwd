@@ -22,15 +22,23 @@ pub enum MenuCommand {
     ExportReveal,
     ShowWelcome,
     ChangeMasterPassword,
+    EnableSecondFactor,
+    AddSmartCard,
+    RotateRecoveryCode,
+    DisableSecondFactor,
+    ToggleLockOnCardRemoval,
+    /// Index into the unlocked user's second-factor slots.
+    RemoveSlot(u32),
 }
 
 const PARAM_CLIPBOARD: isize = 100_000;
 const PARAM_IDLE: isize = 200_000;
 const PARAM_USER: isize = 300_000;
+const PARAM_SLOT: isize = 400_000;
 const PARAM_SPAN: isize = 100_000;
 
 impl MenuCommand {
-    const SIMPLE: [(MenuCommand, isize); 14] = [
+    const SIMPLE: [(MenuCommand, isize); 19] = [
         (MenuCommand::Open, 1),
         (MenuCommand::Lock, 2),
         (MenuCommand::Quit, 3),
@@ -45,6 +53,11 @@ impl MenuCommand {
         (MenuCommand::ExportReveal, 24),
         (MenuCommand::ShowWelcome, 30),
         (MenuCommand::ChangeMasterPassword, 31),
+        (MenuCommand::EnableSecondFactor, 40),
+        (MenuCommand::AddSmartCard, 41),
+        (MenuCommand::RotateRecoveryCode, 42),
+        (MenuCommand::DisableSecondFactor, 43),
+        (MenuCommand::ToggleLockOnCardRemoval, 44),
     ];
 
     /// Encode as an `NSMenuItem` tag (always > 0).
@@ -53,6 +66,7 @@ impl MenuCommand {
             Self::ClipboardClear(s) => PARAM_CLIPBOARD + (s as isize).min(PARAM_SPAN - 1),
             Self::IdleLock(m) => PARAM_IDLE + (m as isize).min(PARAM_SPAN - 1),
             Self::SelectUser(i) => PARAM_USER + (i as isize).min(PARAM_SPAN - 1),
+            Self::RemoveSlot(i) => PARAM_SLOT + (i as isize).min(PARAM_SPAN - 1),
             simple => Self::SIMPLE.iter().find(|(c, _)| *c == simple).map_or(0, |(_, t)| *t),
         }
     }
@@ -68,6 +82,9 @@ impl MenuCommand {
             }
             t if (PARAM_USER..PARAM_USER + PARAM_SPAN).contains(&t) => {
                 Some(Self::SelectUser((t - PARAM_USER) as u32))
+            }
+            t if (PARAM_SLOT..PARAM_SLOT + PARAM_SPAN).contains(&t) => {
+                Some(Self::RemoveSlot((t - PARAM_SLOT) as u32))
             }
             t => Self::SIMPLE.iter().find(|(_, x)| *x == t).map(|(c, _)| *c),
         }
@@ -184,6 +201,7 @@ mod tests {
                 MenuCommand::IdleLock(15),
                 MenuCommand::SelectUser(0),
                 MenuCommand::SelectUser(7),
+                MenuCommand::RemoveSlot(3),
             ]);
         for c in all {
             assert!(c.tag() > 0);

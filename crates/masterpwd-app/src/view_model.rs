@@ -37,6 +37,9 @@ pub enum VmEffect {
     CloseWindow,
     /// Ask the user; feed the answer to [`SitesViewModel::answer`].
     Ask(Ask),
+    /// Unlock a second-factor user: the core obtains the second secret (card
+    /// or recovery code) for `password`.
+    SecondFactorUnlock { name: String, password: Zeroizing<String> },
 }
 
 impl fmt::Debug for VmEffect {
@@ -47,6 +50,7 @@ impl fmt::Debug for VmEffect {
             Self::Copy { .. } => f.write_str("Copy(<redacted>)"),
             Self::CloseWindow => f.write_str("CloseWindow"),
             Self::Ask(a) => write!(f, "Ask({a:?})"),
+            Self::SecondFactorUnlock { name, .. } => write!(f, "SecondFactorUnlock({name}, <redacted>)"),
         }
     }
 }
@@ -176,11 +180,22 @@ impl TypeChoice {
     }
 }
 
+/// The smart-card step of unlocking a second-factor user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CardPanel {
+    pub note: String,
+    /// Offer "Try Card Again" (a card is present; one attempt per press).
+    pub can_retry: bool,
+    /// Busy: an unwrap or key derivation is running.
+    pub busy: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserRow {
     pub full_name: String,
     pub avatar: u32,
     pub saved_keys: bool,
+    pub second_factor: bool,
 }
 
 /// What the window renders.  May contain the revealed result: drop promptly.
@@ -194,6 +209,8 @@ pub struct SitesView {
     pub picked_avatar: u32,
     pub can_unlock: bool,
     pub can_quick_unlock: bool,
+    /// Second-factor unlock in progress: what the card step shows.
+    pub card: Option<CardPanel>,
     pub new_name: String,
     pub new_avatar: u32,
     pub can_create: bool,
@@ -267,6 +284,7 @@ pub struct SitesViewModel {
     notice: Option<String>,
     hide_passwords: bool,
     reveal: bool,
+    card: Option<CardPanel>,
 }
 
 impl SitesViewModel {
@@ -297,6 +315,7 @@ impl SitesViewModel {
             notice: None,
             hide_passwords: false,
             reveal: false,
+            card: None,
         };
         vm.refresh_users();
         vm
@@ -409,6 +428,11 @@ impl SitesViewModel {
                 return;
             }
             self.lock();
+        }
+        if self.screen == Screen::Unlocking && self.card.is_some() {
+            // Leave the second-factor step of the previous user.
+            self.card = None;
+            self.screen = Screen::Pick;
         }
         if self.screen == Screen::Unlocking {
             return;
@@ -536,7 +560,45 @@ impl SitesViewModel {
         }
         self.error = None;
         let password = std::mem::replace(&mut self.master_password, Zeroizing::new(String::new()));
+        if self.picked_entry().is_some_and(|e| e.second_factor.is_enabled()) {
+            self.screen = Screen::Unlocking;
+            self.pending_job = None;
+            self.card = Some(CardPanel { note: "Checking for your smart card…".into(), can_retry: false, busy: true });
+            return vec![VmEffect::SecondFactorUnlock { name, password }];
+        }
         vec![self.start_job(DerivePurpose::Unlock, &name, password)]
+    }
+
+    /// The core's second-factor unlock step (card / recovery code).
+    pub fn card_active(&self) -> bool {
+        self.card.is_some()
+    }
+
+    pub fn set_card_panel(&mut self, panel: Option<CardPanel>) {
+        self.card = panel;
+    }
+
+    /// Give up the second-factor step and return to the password.
+    pub fn cancel_second_factor(&mut self, error: Option<String>) {
+        self.card = None;
+        if self.screen == Screen::Unlocking && self.session.is_none() {
+            self.screen = Screen::Pick;
+        }
+        self.error = error;
+    }
+
+    /// Replace the session's user and keys together (after a re-keying
+    /// operation: enabling/disabling the second factor, a new recovery code,
+    /// a master-password change).  `keys` must unlock `user`.
+    pub fn replace_session(&mut self, user: User, keys: UserKeys) {
+        if let Some(s) = &mut self.session {
+            if s.user.full_name() == user.full_name() && user.is_unlocked_by(&keys) {
+                s.user = user;
+                s.keys = keys;
+                s.dirty_since.get_or_insert_with(Instant::now);
+                self.refresh_candidates();
+            }
+        }
     }
 
     fn submit_new_user(&mut self) -> Vec<VmEffect> {
@@ -639,6 +701,7 @@ impl SitesViewModel {
     fn begin_session(&mut self, user: User, keys: UserKeys) {
         self.picked = Some(user.full_name().to_owned());
         self.session = Some(Session { user, keys, dirty_since: None });
+        self.card = None;
         self.screen = Screen::Unlocked;
         self.identicon = None;
         self.master_password = Zeroizing::new(String::new());
@@ -729,6 +792,7 @@ impl SitesViewModel {
     pub fn lock(&mut self) {
         self.persist_now();
         self.session = None; // UserKeys and User are dropped; keys are wiped
+        self.card = None;
         self.pending_job = None;
         self.next_job += 1;
         self.master_password = Zeroizing::new(String::new());
@@ -1143,7 +1207,12 @@ impl SitesViewModel {
         let users: Vec<UserRow> = self
             .users
             .iter()
-            .map(|u| UserRow { full_name: u.full_name.clone(), avatar: u.avatar, saved_keys: u.saved_keys })
+            .map(|u| UserRow {
+                full_name: u.full_name.clone(),
+                avatar: u.avatar,
+                saved_keys: u.saved_keys,
+                second_factor: u.second_factor.is_enabled(),
+            })
             .collect();
         let picked = if self.picking_new || self.screen == Screen::NewUser {
             Some(users.len())
@@ -1158,7 +1227,10 @@ impl SitesViewModel {
         };
         let prompt = match (self.screen, &self.session) {
             (_, Some(s)) => format!("{}'s {what} for:", s.user.full_name()),
-            (Screen::Unlocking, _) => "Unlocking…".to_owned(),
+            (Screen::Unlocking, _) => match &self.card {
+                Some(_) => format!("{} needs a smart card or recovery code:", self.picked.as_deref().unwrap_or("This user")),
+                None => "Unlocking…".to_owned(),
+            },
             (Screen::NewUser, _) if self.users.is_empty() => {
                 "Welcome! Create your user: your full name and a master password".to_owned()
             }
@@ -1197,7 +1269,9 @@ impl SitesViewModel {
             picked_name: self.picked.clone().unwrap_or_default(),
             picked_avatar: entry.map_or(0, |e| e.avatar),
             can_unlock: self.screen == Screen::Pick && self.picked.is_some() && !self.master_password.is_empty(),
-            can_quick_unlock: self.screen == Screen::Pick && entry.is_some_and(|e| e.saved_keys),
+            can_quick_unlock: self.screen == Screen::Pick
+                && entry.is_some_and(|e| e.saved_keys && !e.second_factor.is_enabled()),
+            card: self.card.clone(),
             new_name: self.new_name.clone(),
             new_avatar: self.new_avatar,
             can_create: self.screen == Screen::NewUser

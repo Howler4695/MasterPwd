@@ -45,6 +45,9 @@ pub const TAG_ADD_QUESTION: isize = 22;
 pub const TAG_REMOVE_QUESTION: isize = 23;
 pub const TAG_UPGRADE: isize = 24;
 pub const TAG_DELETE_SITE: isize = 25;
+pub const TAG_CARD_RETRY: isize = 26;
+pub const TAG_RECOVERY_CODE: isize = 27;
+pub const TAG_CARD_CANCEL: isize = 28;
 pub const TAG_USERS_TABLE: isize = 30;
 pub const TAG_SITES_TABLE: isize = 31;
 
@@ -125,6 +128,10 @@ pub struct SitesWindow {
     identicon: Retained<NSTextField>,
     unlock: Retained<NSButton>,
     quick_unlock: Retained<NSButton>,
+    card_note: Retained<NSTextField>,
+    card_retry: Retained<NSButton>,
+    card_code: Retained<NSButton>,
+    card_cancel: Retained<NSButton>,
     spinner: Retained<NSProgressIndicator>,
     new_name: Retained<NSTextField>,
     new_password: Retained<NSSecureTextField>,
@@ -348,6 +355,18 @@ impl SitesWindow {
             "Uses this user's derived keys saved in your login Keychain, after Touch ID or your Mac password.",
         )));
         add(&quick_unlock);
+        // Second-factor unlock step.
+        let card_note = NSTextField::wrappingLabelWithString(&ns(""), mtm);
+        card_note.setFrame(rect(RIGHT, 236.0, RIGHT_W, 70.0));
+        card_note.setFont(Some(&NSFont::systemFontOfSize(13.0)));
+        add(&card_note);
+        let card_retry = button(mtm, "Try Card Again", t, TAG_CARD_RETRY, rect(RIGHT, 196.0, 140.0, 32.0));
+        card_retry.setToolTip(Some(&ns("One more attempt with the inserted card (asks for its PIN once).")));
+        add(&card_retry);
+        let card_code = button(mtm, "Use Recovery Code…", t, TAG_RECOVERY_CODE, rect(RIGHT + 142.0, 196.0, 170.0, 32.0));
+        add(&card_code);
+        let card_cancel = button(mtm, "Cancel", t, TAG_CARD_CANCEL, rect(RIGHT, 158.0, 100.0, 32.0));
+        add(&card_cancel);
         let spinner = NSProgressIndicator::initWithFrame(NSProgressIndicator::alloc(mtm), rect(494.0, 203.0, 18.0, 18.0));
         spinner.setStyle(NSProgressIndicatorStyle::Spinning);
         spinner.setIndeterminate(true);
@@ -456,6 +475,10 @@ impl SitesWindow {
             identicon,
             unlock,
             quick_unlock,
+            card_note,
+            card_retry,
+            card_code,
+            card_cancel,
             spinner,
             new_name,
             new_password,
@@ -618,7 +641,11 @@ impl SitesWindow {
                     Some(u) => (
                         u.full_name.clone(),
                         avatars::avatar(u.avatar),
-                        u.saved_keys.then_some("Touch ID"),
+                        if u.second_factor {
+                            Some("Smart card required")
+                        } else {
+                            u.saved_keys.then_some("Touch ID")
+                        },
                     ),
                     None if row == users.len() => ("New User…".to_owned(), avatars::add_user(), None),
                     None => return None,
@@ -705,7 +732,25 @@ impl SitesWindow {
         for v in [&*self.pick_avatar as &NSView, &self.pick_name, &self.master_password, &self.unlock] {
             v.setHidden(!pick);
         }
-        self.quick_unlock.setHidden(!pick || !view.can_quick_unlock);
+        self.quick_unlock.setHidden(!pick || !view.can_quick_unlock || view.card.is_some());
+        match &view.card {
+            Some(card) => {
+                for v in [&*self.card_note as &NSView, &self.card_code, &self.card_cancel] {
+                    v.setHidden(false);
+                }
+                set_text(&self.card_note, &card.note);
+                self.card_retry.setHidden(!card.can_retry);
+                self.card_code.setEnabled(!card.busy);
+                self.card_retry.setEnabled(!card.busy);
+                self.master_password.setHidden(true);
+                self.unlock.setHidden(true);
+            }
+            None => {
+                for v in [&*self.card_note as &NSView, &self.card_retry, &self.card_code, &self.card_cancel] {
+                    v.setHidden(true);
+                }
+            }
+        }
         self.quick_unlock.setEnabled(view.screen == Screen::Pick);
         self.pick_avatar.setImage(avatars::avatar(view.picked_avatar).as_deref());
         set_text(&self.pick_name, &view.picked_name);
@@ -720,7 +765,14 @@ impl SitesWindow {
                 self.new_name.setStringValue(&ns(""));
             }
         }
-        if view.screen == Screen::Unlocking {
+        // Spin only while something is running (not while waiting for a card),
+        // next to the card note when there is one.
+        self.spinner.setFrame(if view.card.is_some() {
+            rect(RIGHT + RIGHT_W - 18.0, 312.0, 18.0, 18.0)
+        } else {
+            rect(494.0, 203.0, 18.0, 18.0)
+        });
+        if view.screen == Screen::Unlocking && view.card.as_ref().map_or(true, |c| c.busy) {
             // SAFETY: plain AppKit call on the main thread.
             unsafe { self.spinner.startAnimation(None) };
         } else {

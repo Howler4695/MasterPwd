@@ -31,6 +31,9 @@ pub struct UserEntry {
     pub saved_keys: bool,
     /// The user's own "hide passwords" preference.
     pub mask_passwords: bool,
+    /// The user's second factor (slots hold wrapped secrets and fingerprints;
+    /// nothing identifying).
+    pub second_factor: mpw_model::SecondFactorStatus,
 }
 
 /// Errors shown to the user.  Never contain secrets.
@@ -141,6 +144,7 @@ impl DataStore for DiskStore {
                 site_count: u.summary.site_count,
                 saved_keys: u.summary.preferences.biometric_lock,
                 mask_passwords: u.summary.preferences.mask_passwords,
+                second_factor: u.summary.second_factor,
             })
             .collect())
     }
@@ -198,6 +202,7 @@ impl DataStore for MemoryStore {
                 site_count: u.sites().len(),
                 saved_keys: u.preferences.biometric_lock,
                 mask_passwords: u.preferences.mask_passwords,
+                second_factor: u.second_factor_status().clone(),
             })
             .collect();
         list.sort_by(|a, b| b.last_used.cmp(&a.last_used).then(a.full_name.cmp(&b.full_name)));

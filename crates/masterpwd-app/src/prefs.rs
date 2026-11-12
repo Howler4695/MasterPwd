@@ -20,6 +20,7 @@ pub const KEY_CLIPBOARD_CLEAR_SECONDS: &str = "clipboardClearSeconds";
 pub const KEY_IDLE_LOCK_MINUTES: &str = "idleLockMinutes";
 pub const KEY_WELCOME_SHOWN: &str = "welcomeShown";
 pub const KEY_LAST_FULL_NAME: &str = "lastFullName";
+pub const KEY_LOCK_ON_CARD_REMOVAL: &str = "lockOnCardRemoval";
 
 /// Choices offered in the menu.  0 = never.
 pub const CLIPBOARD_CLEAR_CHOICES: [u32; 5] = [15, 30, 60, 120, 0];
@@ -39,6 +40,8 @@ pub struct Preferences {
     pub welcome_shown: bool,
     /// Pre-filled in the sites window.  Not secret (the original stored it too).
     pub last_full_name: Option<String>,
+    /// Lock as soon as the smart card that unlocked the user is removed.
+    pub lock_on_card_removal: bool,
 }
 
 impl Default for Preferences {
@@ -50,6 +53,7 @@ impl Default for Preferences {
             idle_lock_minutes: 15,
             welcome_shown: false,
             last_full_name: None,
+            lock_on_card_removal: true,
         }
     }
 }
@@ -75,6 +79,7 @@ impl Preferences {
             last_full_name: store
                 .get_string(KEY_LAST_FULL_NAME)
                 .filter(|s| !s.trim().is_empty() && s.len() < 1024),
+            lock_on_card_removal: store.get_bool(KEY_LOCK_ON_CARD_REMOVAL).unwrap_or(d.lock_on_card_removal),
         }
     }
 
@@ -85,6 +90,7 @@ impl Preferences {
         store.set_int(KEY_IDLE_LOCK_MINUTES, i64::from(self.idle_lock_minutes));
         store.set_bool(KEY_WELCOME_SHOWN, self.welcome_shown);
         store.set_string(KEY_LAST_FULL_NAME, self.last_full_name.as_deref());
+        store.set_bool(KEY_LOCK_ON_CARD_REMOVAL, self.lock_on_card_removal);
     }
 
     pub fn clipboard_timeout(&self) -> Option<Duration> {
@@ -151,6 +157,7 @@ mod tests {
             idle_lock_minutes: 0,
             welcome_shown: true,
             last_full_name: Some("Robert Lee Mitchell".into()),
+            lock_on_card_removal: false,
         };
         p.save(&mut store);
         let loaded = Preferences::load(&store);
