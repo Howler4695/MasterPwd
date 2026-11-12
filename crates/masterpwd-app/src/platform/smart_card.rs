@@ -162,6 +162,9 @@ impl SystemCards {
             if slot == PivSlot::Unknown {
                 slot = PivSlot::from_label(&cert.subject_summary());
             }
+            if slot == PivSlot::Unknown {
+                slot = PivSlot::from_usage(info.as_ref().and_then(|i| i.key_usage));
+            }
             let name = info.as_ref().and_then(|i| i.common_name.clone()).unwrap_or_else(|| cert.subject_summary());
             out.push((
                 CardKey {
@@ -328,7 +331,23 @@ pub fn diagnose(verbose: bool) -> i32 {
         println!("    fingerprint:  SHA-256 {}", crate::card::hex(&k.fingerprint));
         println!("    slot (guess): {}", k.slot.describe());
         println!("    key:          {}", k.kind);
-        println!("    key usage:    {:?}", k.usage);
+        let usage = match k.usage {
+            None => "not stated".to_string(),
+            Some(u) => {
+                let names: Vec<&str> = [
+                    (u.digital_signature, "digitalSignature"),
+                    (u.non_repudiation, "nonRepudiation"),
+                    (u.key_encipherment, "keyEncipherment"),
+                    (u.data_encipherment, "dataEncipherment"),
+                    (u.key_agreement, "keyAgreement"),
+                ]
+                .into_iter()
+                .filter_map(|(set, name)| set.then_some(name))
+                .collect();
+                if names.is_empty() { "none of the usages we look at".to_string() } else { names.join(", ") }
+            }
+        };
+        println!("    key usage:    {usage}");
         println!("    valid:        {} … {}{}", date(k.not_before), date(k.not_after), if k.is_expired(now) { " (EXPIRED)" } else { "" });
         let algs: Vec<&str> = k.algorithms.iter().map(|a| a.id()).collect();
         println!("    decrypts with: {}", if algs.is_empty() { "nothing we use".into() } else { algs.join(", ") });
@@ -401,8 +420,12 @@ mod tests {
     }
 
     #[test]
-    fn system_enumeration_without_a_card_is_empty_not_an_error() {
+    fn system_enumeration_never_fails_whether_or_not_a_card_is_inserted() {
+        // Must hold on a machine with no card (empty list) and on one with a
+        // card in the reader: read-only, nothing is decrypted, no PIN asked.
         let keys = SystemCards.keys().expect("enumeration should not fail");
-        assert!(keys.is_empty(), "a card is inserted? {keys:?}");
+        for key in &keys {
+            assert!(is_smart_card_token(&key.token_id), "not a smart card token: {}", key.token_id);
+        }
     }
 }

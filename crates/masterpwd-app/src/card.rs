@@ -103,6 +103,19 @@ impl PivSlot {
         }
     }
 
+    /// Fallback for cards whose item labels do not name the slot (seen on a
+    /// DoD CAC): infer the role from the certificate's key usage.  An
+    /// authentication certificate cannot be told from a card-authentication
+    /// one this way; both sign and neither is ever used for wrapping.
+    pub fn from_usage(usage: Option<KeyUsage>) -> Self {
+        match usage {
+            Some(u) if (u.key_encipherment || u.key_agreement) && !u.digital_signature => Self::KeyManagement,
+            Some(u) if u.digital_signature && u.non_repudiation => Self::Signature,
+            Some(u) if u.digital_signature => Self::Authentication,
+            _ => Self::Unknown,
+        }
+    }
+
     pub fn describe(self) -> &'static str {
         match self {
             Self::Authentication => "PIV Authentication (9A)",
@@ -433,5 +446,18 @@ mod tests {
         assert_eq!(PivSlot::from_label("Certificate For PIV Authentication"), PivSlot::Authentication);
         assert_eq!(PivSlot::from_label("Certificate For Card Authentication"), PivSlot::CardAuthentication);
         assert_eq!(PivSlot::from_label("whatever"), PivSlot::Unknown);
+
+        // Fallback by key usage, as needed for a real CAC.
+        let usage = |sig, nr, enc| Some(KeyUsage {
+            digital_signature: sig,
+            non_repudiation: nr,
+            key_encipherment: enc,
+            data_encipherment: false,
+            key_agreement: false,
+        });
+        assert_eq!(PivSlot::from_usage(usage(false, false, true)), PivSlot::KeyManagement);
+        assert_eq!(PivSlot::from_usage(usage(true, true, false)), PivSlot::Signature);
+        assert_eq!(PivSlot::from_usage(usage(true, false, false)), PivSlot::Authentication);
+        assert_eq!(PivSlot::from_usage(None), PivSlot::Unknown);
     }
 }
