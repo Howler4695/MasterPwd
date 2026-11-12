@@ -1,0 +1,16 @@
+[package]
+name = "mpw-cli"
+description = "Command-line Master Password client, compatible with the reference `mpw` tool."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "mpw"
+path = "src/main.rs"
+
+[dependencies]
+mpw-core = { path = "../mpw-core" }
+mpw-model = { path = "../mpw-model" }

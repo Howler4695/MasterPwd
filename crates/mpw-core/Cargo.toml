@@ -1,0 +1,13 @@
+[package]
+name = "mpw-core"
+description = "The Master Password algorithm (v0-v3): stateless site password derivation."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+zeroize = { version = "1", features = ["derive"] }
+subtle = "2"
+thiserror = "2"

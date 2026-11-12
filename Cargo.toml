@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/mpw-core",
+    "crates/mpw-model",
+    "crates/mpw-cli",
+    "crates/masterpwd-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/Howler4695/MasterPwd"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+overflow-checks = true
+
+# scrypt is unusably slow unoptimised; keep debug builds and tests responsive.
+[profile.dev.package."*"]
+opt-level = 3
+[profile.test.package."*"]
+opt-level = 3

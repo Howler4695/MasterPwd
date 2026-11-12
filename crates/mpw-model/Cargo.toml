@@ -1,0 +1,11 @@
+[package]
+name = "mpw-model"
+description = "Master Password users, sites and questions, with the mpsites/mpjson export formats and on-disk storage."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+mpw-core = { path = "../mpw-core" }
