@@ -319,6 +319,12 @@ impl Site {
 
     /// Generate the login name from a template (e.g. [`ResultType::TemplateName`])
     /// for this site, instead of inheriting the user's.
+    ///
+    /// Export files use format 1, the only layout every Master Password/Spectre
+    /// generation reads, and in format 1 an explicit
+    /// [`ResultType::TemplateName`] is indistinguishable from "use the user's
+    /// login": after a save/load it becomes `None`.  This only matters when the
+    /// user has a personal login name.
     pub fn set_generated_login(&mut self, template: ResultType) -> Result<()> {
         if !template.is_template() {
             return Err(Error::NotStateful(template));

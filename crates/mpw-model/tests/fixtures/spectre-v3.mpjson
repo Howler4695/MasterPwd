@@ -1,0 +1,29 @@
+{
+  "export": {
+    "date": "2025-01-01T10:00:00Z",
+    "redacted": true,
+    "format": 3
+  },
+  "user": {
+    "avatar": 2,
+    "full_name": "Robert Lee Mitchell",
+    "algorithm": 3,
+    "key_id": "98EEF4D1DF46D849574A82A03C3177056B15DFFCA29BB3899DE4628453675302",
+    "result_type": 18,
+    "login_type": 30,
+    "last_used": "2025-01-01T10:00:00Z"
+  },
+  "sites": {
+    "masterpasswordapp.com": {
+      "counter": 1,
+      "algorithm": 3,
+      "type": 17,
+      "uses": 4,
+      "last_used": "2024-12-31T10:00:00Z",
+      "_ext_spectre": {
+        "url": "https://masterpasswordapp.com",
+        "domains": "masterpasswordapp.com"
+      }
+    }
+  }
+}

@@ -11,6 +11,24 @@
 //!                           "_ext_mpw": { "url" } } } }
 //! ```
 //! Members we do not interpret are kept and written back after ours.
+//!
+//! # Generations (verified against `spectre-app/api`, the continuation of the
+//! upstream C library)
+//!
+//! | generation | writes `export.format` | sites key | user login keys | site `login_type` absent/0 | url |
+//! |---|---|---|---|---|---|
+//! | classic (≤ 2020-09-13, `ac34ba1`) | 1 | `sites` | — | absent: 30; 0: rejected | `_ext_mpw` |
+//! | user-login (`f40a38d`, `ebed134`) | 2 | `sites` | `login_type`, `login_name` | "use the user's login" | `_ext_mpw` |
+//! | transitional (`71dacb0`…`55a34e6^`, the old macOS app) | 2 | `services` | same | same | `_ext_mpw` |
+//! | Spectre (`55a34e6`, `28761d8`…) | 2, later 3 | `sites` | same; v3: `default_type` → `result_type` | same | `_ext_spectre` |
+//!
+//! Every reader since `ebed134` applies "version 1 fixes" to `format: 1` files:
+//! a site `login_type` of 30 is dropped (meaning "use the user's login"), and
+//! the transitional readers rename `sites` to `services` — but *only* for
+//! format 1.  A format-2 file is therefore readable either by the transitional
+//! readers (`services`) or by the others (`sites`), never by both, while a
+//! format-1 `sites` file is read correctly by all of them.  So we write format 1
+//! with `sites`, the classic layout, and read every generation.
 
 use super::{
     check_len, file_time, parse_algorithm, parse_key_id, parse_time, parse_type, perr, Outputs, Pending, Slot,
@@ -31,6 +49,18 @@ use zeroize::{Zeroize, Zeroizing};
 type PResult<T> = std::result::Result<T, ParseError>;
 
 const EXT: &str = "_ext_mpw";
+const EXT_SPECTRE: &str = "_ext_spectre";
+
+fn ext_url(ext: Option<&Value>, loc: &str) -> PResult<Option<String>> {
+    match ext.and_then(|e| e.get("url")) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(u)) => {
+            check_len(u, None, loc)?;
+            Ok(Some(u.clone()))
+        }
+        Some(_) => Err(err(ParseErrorKind::InvalidValue, loc)),
+    }
+}
 
 fn err(kind: ParseErrorKind, location: impl Into<String>) -> ParseError {
     perr(kind, None, location)
@@ -147,6 +177,10 @@ fn read_root(root: &mut JsonMap) -> PResult<(UserSummary, User, Vec<Pending>)> {
         Some(_) => return Err(err(ParseErrorKind::InvalidValue, "export.redacted")),
     };
     let format_version = take_uint(&mut export, "format", u64::MAX, "export.format")?.unwrap_or(1);
+    // Format 1 (and files without a format): a site login type of 30 is the
+    // classic writer's default and means "use the user's login" (upstream's
+    // "version 1 fixes").
+    let v1_login_fix = format_version <= 1;
 
     // -------------------------------------------------------------------- user
     let mut u = take_object(root, "user", "user")?.ok_or_else(|| err(ParseErrorKind::Missing, "user"))?;
@@ -163,7 +197,9 @@ fn read_root(root: &mut JsonMap) -> PResult<(UserSummary, User, Vec<Pending>)> {
         Some(s) => parse_key_id(&s, None, "user.key_id")?,
         None => None,
     };
-    let default_type = match take_uint(&mut u, "default_type", u64::MAX, "user.default_type")? {
+    // Spectre format 3 renamed `default_type` to `result_type` (which wins if both exist).
+    let legacy_default = take_uint(&mut u, "default_type", u64::MAX, "user.default_type")?;
+    let default_type = match take_uint(&mut u, "result_type", u64::MAX, "user.result_type")?.or(legacy_default) {
         Some(v) => parse_type(v, None, "user.default_type")?,
         None => ResultType::DEFAULT,
     };
@@ -205,11 +241,24 @@ fn read_root(root: &mut JsonMap) -> PResult<(UserSummary, User, Vec<Pending>)> {
     }
 
     // ------------------------------------------------------------------- sites
-    let sites = match (take_object(root, "sites", "sites")?, take_object(root, "services", "services")?) {
-        (Some(_), Some(_)) => return Err(err(ParseErrorKind::AmbiguousSites, "sites")),
-        (Some(s), None) | (None, Some(s)) => s,
-        (None, None) => JsonMap::new(),
-    };
+    // The transitional library wrote `services`.  If both exist, merge them like
+    // Spectre's "version 2 fixes": a service replaces a site of the same name
+    // unless the site is known to be more recently used.
+    let mut sites = take_object(root, "sites", "sites")?.unwrap_or_default();
+    if let Some(services) = take_object(root, "services", "services")? {
+        if services.len() > limits::MAX_SITES {
+            return Err(err(ParseErrorKind::TooMany { what: "sites", limit: limits::MAX_SITES }, "services"));
+        }
+        let used = |v: Option<&Value>| {
+            v.and_then(|v| v.get("last_used")).and_then(Value::as_str).and_then(Timestamp::parse_rfc3339)
+        };
+        for (name, service) in services {
+            let keep_site = matches!((used(sites.get(&name)), used(Some(&service))), (Some(a), Some(b)) if a >= b);
+            if !keep_site {
+                sites.insert(name, service);
+            }
+        }
+    }
     if sites.len() > limits::MAX_SITES {
         return Err(err(ParseErrorKind::TooMany { what: "sites", limit: limits::MAX_SITES }, "sites"));
     }
@@ -230,14 +279,12 @@ fn read_root(root: &mut JsonMap) -> PResult<(UserSummary, User, Vec<Pending>)> {
             None => user.default_type,
         };
         let password = take_secret(&mut s, "password", &loc("password"))?;
-        // 0 (the original app) means "use the user's login".  The reference C
-        // writer stores 30 (generated name) for every site; while the user's own
-        // login is that same template the two are equivalent, so read it as
-        // "use the user's login" too (and it is written back as 30).
+        // Absent or 0 means "use the user's login" (since `f40a38d`); in format 1
+        // so does 30 (see `v1_login_fix`).
         let login_type = match take_uint(&mut s, "login_type", u64::MAX, &loc("login_type"))? {
             None | Some(0) => None,
             Some(v) => Some(parse_type(v, None, &loc("login_type"))?)
-                .filter(|t| !(*t == ResultType::DEFAULT_LOGIN && user.login_type == ResultType::DEFAULT_LOGIN)),
+                .filter(|t| !(v1_login_fix && *t == ResultType::DEFAULT_LOGIN)),
         };
         let login = take_secret(&mut s, "login_name", &loc("login_name"))?;
         let uses = take_u32(&mut s, "uses", &loc("uses"))?.unwrap_or(0);
@@ -253,16 +300,10 @@ fn read_root(root: &mut JsonMap) -> PResult<(UserSummary, User, Vec<Pending>)> {
             ));
         }
         let ext_mpw = s.remove(EXT);
-        let url = match &ext_mpw {
-            Some(Value::Object(m)) => match m.get("url") {
-                None | Some(Value::Null) => None,
-                Some(Value::String(u)) => {
-                    check_len(u, None, &loc("url"))?;
-                    Some(u.clone())
-                }
-                Some(_) => return Err(err(ParseErrorKind::InvalidValue, loc("url"))),
-            },
-            _ => None,
+        // Spectre keeps the URL in `_ext_spectre` (left in place as an unknown member).
+        let url = match ext_url(ext_mpw.as_ref(), &loc("url"))? {
+            Some(u) => Some(u),
+            None => ext_url(s.get(EXT_SPECTRE), &loc("url"))?,
         };
 
         let mut site = Site::new(&name, algorithm, result_type);
@@ -447,16 +488,13 @@ pub(super) fn write(user: &User, out: &Outputs, redacted: bool, now: Timestamp) 
         if let Some(v) = so.and_then(|so| secret(&so.password)) {
             s.insert("password".into(), v);
         }
-        // "Use the user's login" is 0 in the original app's files, but the
-        // reference C reader rejects 0.  While the user's login is the default
-        // generated name, write that type instead: it produces the same login
-        // and every reader accepts it.
-        let login_type = match site.login_type {
-            Some(t) => t.as_u32(),
-            None if user.login_type == ResultType::DEFAULT_LOGIN => ResultType::DEFAULT_LOGIN.as_u32(),
-            None => 0,
-        };
-        s.insert("login_type".into(), Value::from(login_type));
+        // "Use the user's login" is written as 30, exactly like the classic
+        // writer: classic readers reject 0 and read 30 as the generated name;
+        // every newer reader turns 30 in a format-1 file into "use the user's
+        // login".  (So an explicit generated-name login cannot be told apart
+        // from "use the user's login" in this format; see `Site::set_generated_login`.)
+        let login_type = site.login_type.unwrap_or(ResultType::DEFAULT_LOGIN);
+        s.insert("login_type".into(), Value::from(login_type.as_u32()));
         if let Some(v) = so.and_then(|so| secret(&so.login)) {
             s.insert("login_name".into(), v);
         }
@@ -477,6 +515,15 @@ pub(super) fn write(user: &User, out: &Outputs, redacted: bool, now: Timestamp) 
         }
         if let Some(ext) = site_ext_mpw(site) {
             s.insert(EXT.into(), ext);
+        }
+        // Keep a Spectre `_ext_spectre.url` in step with ours.
+        if let Some(Value::Object(spectre)) = site.extra.get(EXT_SPECTRE) {
+            let mut spectre = spectre.clone();
+            match &site.url {
+                Some(u) => spectre.insert("url".into(), Value::String(u.clone())),
+                None => spectre.remove("url"),
+            };
+            s.insert(EXT_SPECTRE.into(), Value::Object(spectre));
         }
         extend(&mut s, &site.extra);
         sites.insert(name.clone(), Value::Object(s));

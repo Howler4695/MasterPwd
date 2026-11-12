@@ -31,6 +31,10 @@
 //! * Results are computed with the key of the *site's* algorithm version.
 //! * [`UserFile`] reads `.mpsites` (format 0, 1) and `.mpjson`; [`write`]
 //!   writes flat format 1 and JSON.  Unknown JSON members round-trip.
+//!   JSON from every library generation is read (classic `sites` format 1,
+//!   the old macOS app's `services` format 2, Spectre's format 2/3 with
+//!   `_ext_spectre` and `result_type`); JSON is always written in the classic
+//!   format-1 `sites` layout, the only one all of them read.
 //! * [`UserStore`] stores users atomically with private permissions.
 //!
 //! # Deviations from the original app

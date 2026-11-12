@@ -119,6 +119,8 @@ pub enum ParseErrorKind {
     TooMany { what: &'static str, limit: usize },
     #[error("value is too long (limit {limit} bytes)")]
     TooLong { limit: usize },
+    /// No longer produced: files with both `sites` and `services` are merged
+    /// like Spectre does.  Kept for API stability.
     #[error("the file has both a \"sites\" and a \"services\" section")]
     AmbiguousSites,
 }

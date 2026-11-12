@@ -169,38 +169,103 @@ fn json_revealed_round_trip() {
     assert_eq!(json(&out), json(&fixture_str("c-revealed.mpjson")));
 }
 
-#[test]
-fn swift_services_file_is_read_and_written_as_sites() {
-    let user = load("swift-services.mpjson");
-    assert_eq!(user.preferences.autofill, Some(true));
-    assert_eq!(user.preferences.attacker.as_deref(), Some("private"));
-    assert_eq!(user.site(MPA).unwrap().login_type(), None);
-    let mut keys = robert();
-    let mut u = user.clone();
-    u.authenticate(&mut keys).unwrap();
-    assert_eq!(u.site_login(&mut keys, MPA).unwrap().as_str(), MPA_LOGIN);
-    let out = write(&user, Format::Json, ExportMode::Redacted).unwrap();
+// ------------------------------------------------------- library generations
+
+/// Writes are always the classic form: format 1, `sites`, site login type 30
+/// for "use the user's login" — the one layout every generation reads.
+fn assert_classic_output(user: &User) -> Value {
+    let out = write(user, Format::Json, ExportMode::Redacted).unwrap();
     let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["export"]["format"], 1);
     assert!(v.get("services").is_none());
-    // "Inherit" is written as the equivalent, universally readable 30 (generated name)...
-    assert_eq!(v["sites"][MPA]["login_type"], 30);
-    // ...and as 0 when the user has a personal login (which the C reader cannot represent anyway).
-    let mut u2 = u.clone();
-    u2.set_user_login_name(&mut keys, "rob").unwrap();
-    let v: Value = serde_json::from_str(&write(&u2, Format::Json, ExportMode::Redacted).unwrap()).unwrap();
-    assert_eq!(v["sites"][MPA]["login_type"], 0);
-    assert_eq!(v["user"]["login_type"], 1056);
-    let back = UserFile::parse(v.to_string().as_bytes()).unwrap().load(&mut keys).unwrap();
-    assert_eq!(back.site_login(&mut keys, MPA).unwrap().as_str(), "rob");
-    let v: Value = serde_json::from_str(&out).unwrap();
-    assert_eq!(v["user"]["_ext_mpw"]["autofill"], true);
-    assert!(v["user"]["_ext_mpw"].get("maskPasswords").is_none());
+    assert!(v["sites"].is_object());
+    assert!(v["user"].get("result_type").is_none() && v["user"]["default_type"].is_u64());
+    for (_, site) in v["sites"].as_object().unwrap() {
+        assert_ne!(site["login_type"], 0, "classic readers reject login_type 0");
+    }
+    v
 }
 
 #[test]
-fn both_sites_and_services_is_rejected() {
-    let text = r#"{"user":{"full_name":"x","last_used":"2020-01-01T00:00:00Z"},"sites":{},"services":{}}"#;
-    assert_eq!(parse_err(text.as_bytes()), ParseErrorKind::AmbiguousSites);
+fn transitional_services_generation() {
+    // The old macOS app's library (MasterPassword core 71dacb0..55a34e6^):
+    // format 2, "services", site login_type 0 = use the user's login.
+    let mut keys = robert();
+    let user = UserFile::parse(&fixture("swift-services.mpjson")).unwrap().load(&mut keys).unwrap();
+    assert_eq!(peek(&fixture("swift-services.mpjson")).unwrap().format_version, 2);
+    assert_eq!(user.preferences.autofill, Some(true));
+    assert_eq!(user.preferences.attacker.as_deref(), Some("private"));
+    assert_eq!(user.sites().count(), 2);
+    let mpa = user.site(MPA).unwrap();
+    assert_eq!(mpa.login_type(), None);
+    assert_eq!(mpa.url.as_deref(), Some("https://masterpasswordapp.com"));
+    assert_eq!(user.site_login(&mut keys, MPA).unwrap().as_str(), MPA_LOGIN);
+    assert_eq!(user.site_password(&mut keys, "personal.example").unwrap().as_str(), PERSONAL_PW);
+    assert_eq!(user.site_login(&mut keys, "personal.example").unwrap().as_str(), PERSONAL_LOGIN);
+
+    let v = assert_classic_output(&user);
+    assert_eq!(v["sites"][MPA]["login_type"], 30);
+    assert_eq!(v["user"]["_ext_mpw"]["autofill"], true);
+    assert!(v["user"]["_ext_mpw"].get("maskPasswords").is_none());
+    // Reading our output back gives the same user.
+    let back = UserFile::parse(v.to_string().as_bytes()).unwrap().load(&mut keys).unwrap();
+    assert_eq!(back, user);
+}
+
+#[test]
+fn spectre_format_2_generation() {
+    // Spectre (spectre-app/api 28761d8+): format 2, "sites", user-level login,
+    // explicit login_type 30 is a real choice, URL under _ext_spectre.
+    let mut keys = robert();
+    let user = UserFile::parse(&fixture("spectre-v2.mpjson")).unwrap().load(&mut keys).unwrap();
+    assert_eq!(user.login_type(), ResultType::StatefulPersonal);
+    assert_eq!(user.user_login(&mut keys).unwrap().as_str(), PERSONAL_LOGIN);
+    // login_type 0: use the user's (personal) login.
+    assert_eq!(user.site("inherits.example").unwrap().login_type(), None);
+    assert_eq!(user.site_login(&mut keys, "inherits.example").unwrap().as_str(), PERSONAL_LOGIN);
+    // login_type 30 in format 2: an explicit generated name.
+    let mpa = user.site(MPA).unwrap();
+    assert_eq!(mpa.login_type(), Some(ResultType::TemplateName));
+    assert_eq!(user.site_login(&mut keys, MPA).unwrap().as_str(), MPA_LOGIN);
+    assert_eq!(mpa.url.as_deref(), Some("https://masterpasswordapp.com"));
+
+    let mut edited = user.clone();
+    edited.site_mut(MPA).unwrap().url = Some("https://example.org".into());
+    let v = assert_classic_output(&edited);
+    assert_eq!(v["user"]["login_type"], 1056);
+    assert!(v["user"]["login_name"].is_string());
+    assert_eq!(v["sites"][MPA]["_ext_mpw"]["url"], "https://example.org");
+    assert_eq!(v["sites"][MPA]["_ext_spectre"]["url"], "https://example.org");
+    // Known format-1 limitation: an explicit generated-name site login reads
+    // back as "use the user's login" (upstream's own version-1 fix does the same).
+    let back = UserFile::parse(v.to_string().as_bytes()).unwrap().load(&mut keys).unwrap();
+    assert_eq!(back.site(MPA).unwrap().login_type(), None);
+    assert_eq!(back.site_login(&mut keys, "inherits.example").unwrap().as_str(), PERSONAL_LOGIN);
+}
+
+#[test]
+fn spectre_format_3_generation() {
+    // spectre-app/api e719d7b+: format 3, user.default_type renamed result_type.
+    let mut keys = robert();
+    let user = UserFile::parse(&fixture("spectre-v3.mpjson")).unwrap().load(&mut keys).unwrap();
+    assert_eq!(user.default_type, ResultType::TemplateMedium);
+    assert_eq!(user.site(MPA).unwrap().url.as_deref(), Some("https://masterpasswordapp.com"));
+    assert_eq!(user.site_password(&mut keys, MPA).unwrap().as_str(), MPA_V3_LONG);
+    let v = assert_classic_output(&user);
+    assert_eq!(v["user"]["default_type"], 18);
+    assert_eq!(v["sites"][MPA]["_ext_spectre"]["domains"], "masterpasswordapp.com");
+}
+
+#[test]
+fn sites_and_services_are_merged_by_last_used() {
+    // Spectre's "version 2 fixes": services move into sites unless the site is newer.
+    let text = r#"{"export":{"format":2},"user":{"full_name":"x","last_used":"2020-01-01T00:00:00Z"},
+        "sites":{"a":{"counter":1,"last_used":"2020-01-02T00:00:00Z"},"b":{"counter":1,"last_used":"2020-01-01T00:00:00Z"}},
+        "services":{"a":{"counter":2,"last_used":"2020-01-01T00:00:00Z"},"b":{"counter":2,"last_used":"2020-01-02T00:00:00Z"},
+                    "c":{"counter":2,"last_used":"2020-01-01T00:00:00Z"}}}"#;
+    let user = UserFile::parse(text.as_bytes()).unwrap().load_locked().unwrap();
+    let counters: Vec<_> = user.sites().map(|s| (s.name().to_owned(), s.counter)).collect();
+    assert_eq!(counters, [("a".to_owned(), 1), ("b".to_owned(), 2), ("c".to_owned(), 2)]);
 }
 
 // --------------------------------------------------------------- conversions

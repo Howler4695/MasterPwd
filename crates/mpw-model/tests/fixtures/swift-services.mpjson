@@ -2,11 +2,12 @@
   "export": {
     "date": "2020-10-01T10:00:00Z",
     "redacted": true,
-    "format": 1
+    "format": 2
   },
   "user": {
     "avatar": 5,
     "full_name": "Robert Lee Mitchell",
+    "identicon": "2:╚☻╯⛄",
     "algorithm": 3,
     "key_id": "98EEF4D1DF46D849574A82A03C3177056B15DFFCA29BB3899DE4628453675302",
     "default_type": 17,
@@ -24,7 +25,20 @@
       "type": 17,
       "login_type": 0,
       "uses": 3,
-      "last_used": "2020-09-30T10:00:00Z"
+      "last_used": "2020-09-30T10:00:00Z",
+      "_ext_mpw": {
+        "url": "https://masterpasswordapp.com"
+      }
+    },
+    "personal.example": {
+      "counter": 1,
+      "algorithm": 3,
+      "type": 1056,
+      "password": "S3thn+F0DS7pzWY1CqfxEw==",
+      "login_type": 1056,
+      "login_name": "HcMPU+4PpHX9mGQbbL7wySZmXHVfyEApIZ4x6wGQPu8=",
+      "uses": 2,
+      "last_used": "2020-09-29T10:00:00Z"
     }
   }
 }
