@@ -18,6 +18,7 @@
 
 mod algorithm;
 mod error;
+mod templates;
 mod types;
 
 pub use algorithm::{identicon, MasterKey, MASTER_KEY_SIZE};

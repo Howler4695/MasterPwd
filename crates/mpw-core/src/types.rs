@@ -293,7 +293,7 @@ pub const COUNTER_DEFAULT: Counter = COUNTER_INITIAL;
 /// A key ID is stored in user files so a typed master password can be checked
 /// without storing the password.  Comparison is case-insensitive and runs in
 /// constant time.
-#[derive(Clone, Hash)]
+#[derive(Clone)]
 pub struct KeyId(String);
 
 impl KeyId {
@@ -307,6 +307,17 @@ impl KeyId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Build the key ID from a raw SHA-256 digest.
+    pub(crate) fn from_digest(digest: &[u8; 32]) -> Self {
+        const HEX: &[u8; 16] = b"0123456789ABCDEF";
+        let mut hex = String::with_capacity(64);
+        for &b in digest {
+            hex.push(char::from(HEX[usize::from(b >> 4)]));
+            hex.push(char::from(HEX[usize::from(b & 0x0F)]));
+        }
+        Self(hex)
+    }
 }
 
 impl PartialEq for KeyId {
@@ -316,6 +327,14 @@ impl PartialEq for KeyId {
 }
 
 impl Eq for KeyId {}
+
+// Consistent with `PartialEq`: the digest is always stored upper-cased, so
+// equal IDs have identical strings.
+impl std::hash::Hash for KeyId {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
 
 impl fmt::Display for KeyId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -427,11 +446,23 @@ mod tests {
 
     #[test]
     fn result_type_names() {
-        assert_eq!(ResultType::from_name("x"), Some(ResultType::TemplateMaximum));
+        assert_eq!(
+            ResultType::from_name("x"),
+            Some(ResultType::TemplateMaximum)
+        );
         assert_eq!(ResultType::from_name("p"), Some(ResultType::TemplatePhrase));
-        assert_eq!(ResultType::from_name("P"), Some(ResultType::StatefulPersonal));
-        assert_eq!(ResultType::from_name("Long"), Some(ResultType::TemplateLong));
-        assert_eq!(ResultType::from_name("med"), Some(ResultType::TemplateMedium));
+        assert_eq!(
+            ResultType::from_name("P"),
+            Some(ResultType::StatefulPersonal)
+        );
+        assert_eq!(
+            ResultType::from_name("Long"),
+            Some(ResultType::TemplateLong)
+        );
+        assert_eq!(
+            ResultType::from_name("med"),
+            Some(ResultType::TemplateMedium)
+        );
         assert_eq!(ResultType::from_name(""), None);
         assert_eq!(ResultType::from_name("nope"), None);
     }
