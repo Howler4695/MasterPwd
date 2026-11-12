@@ -7,10 +7,79 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[lib]
+name = "masterpwd_app"
+path = "src/lib.rs"
+
 [[bin]]
 name = "MasterPwd"
 path = "src/main.rs"
 
 [dependencies]
 mpw-core = { path = "../mpw-core" }
-mpw-model = { path = "../mpw-model" }
+# mpw-model is wired in next round, behind `data::DataStore`.
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+dispatch2 = { version = "0.3", default-features = false, features = ["std"] }
+security-framework = { version = "3", features = ["OSX_10_15"] }
+objc2-service-management = { version = "0.3", default-features = false, features = [
+    "std",
+    "objc2",
+    "objc2-foundation",
+    "SMAppService",
+] }
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSArray",
+    "NSBundle",
+    "NSData",
+    "NSDate",
+    "NSDistributedNotificationCenter",
+    "NSEnumerator",
+    "NSError",
+    "NSGeometry",
+    "NSNotification",
+    "NSObject",
+    "NSProcessInfo",
+    "NSRunLoop",
+    "NSString",
+    "NSUserDefaults",
+    "NSValue",
+] }
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "objc2-core-foundation",
+    "NSAlert",
+    "NSFontDescriptor",
+    "NSImageView",
+    "NSApplication",
+    "NSButton",
+    "NSButtonCell",
+    "NSCell",
+    "NSColor",
+    "NSControl",
+    "NSEvent",
+    "NSFont",
+    "NSGraphics",
+    "NSImage",
+    "NSMenu",
+    "NSMenuItem",
+    "NSPasteboard",
+    "NSPopUpButton",
+    "NSProgressIndicator",
+    "NSResponder",
+    "NSRunningApplication",
+    "NSSecureTextField",
+    "NSSegmentedControl",
+    "NSStatusBar",
+    "NSStatusBarButton",
+    "NSStatusItem",
+    "NSStepper",
+    "NSText",
+    "NSTextField",
+    "NSTextView",
+    "NSView",
+    "NSWindow",
+    "NSWorkspace",
+] }
