@@ -13,3 +13,8 @@ mpw-core = { path = "../mpw-core" }
 serde_json = { version = "1", features = ["preserve_order"] }
 zeroize = "1"
 thiserror = "2"
+# Second factor: the OS CSPRNG for the second secret, SHA-256 for the recovery
+# code checksum and secret check value, base64 for wrapped secrets in JSON.
+getrandom = "0.3"
+sha2 = "0.10"
+base64 = "0.22"

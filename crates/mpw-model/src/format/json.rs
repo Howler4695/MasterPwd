@@ -212,8 +212,9 @@ fn read_root(root: &mut JsonMap) -> PResult<(UserSummary, User, Vec<Pending>)> {
         Some(v) => parse_type(v, None, "user.login_type")?,
     };
     let login_value = take_secret(&mut u, "login_name", "user.login_name")?;
-    let user_ext = u.remove(EXT);
+    let mut user_ext = u.remove(EXT);
     let prefs = preferences(user_ext.as_ref());
+    let second_factor = crate::second_factor::read_member(&mut user_ext);
 
     let mut pending = Vec::new();
     let mut user = User {
@@ -229,6 +230,7 @@ fn read_root(root: &mut JsonMap) -> PResult<(UserSummary, User, Vec<Pending>)> {
         preferences: prefs,
         sites: BTreeMap::new(),
         extras: UserExtras::default(),
+        second_factor,
     };
     match login_value {
         Some(v) if !redacted => {
@@ -375,6 +377,7 @@ fn read_root(root: &mut JsonMap) -> PResult<(UserSummary, User, Vec<Pending>)> {
         last_used: user.last_used,
         preferences: user.preferences.clone(),
         site_count: user.sites.len(),
+        second_factor: user.second_factor.clone(),
     };
     Ok((summary, user, pending))
 }
@@ -405,6 +408,7 @@ fn user_ext_mpw(user: &User) -> Option<Value> {
         Some(a) => m.insert("attacker".into(), Value::String(a.clone())),
         None => m.remove("attacker"),
     };
+    crate::second_factor::write_member(&user.second_factor, &mut m);
     match original {
         Some(v) if !v.is_object() && m.is_empty() => Some(v.clone()),
         _ if m.is_empty() => None,

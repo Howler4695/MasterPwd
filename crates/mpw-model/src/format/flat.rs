@@ -154,6 +154,7 @@ pub(super) fn read(text: &str) -> Result<(UserSummary, User, Vec<Pending>)> {
         last_used: user.last_used,
         preferences: UserPreferences::default(),
         site_count: user.sites.len(),
+        second_factor: user.second_factor.clone(),
     };
     Ok((summary, user, pending))
 }
@@ -176,6 +177,7 @@ fn finish_header(h: &Header, n: usize) -> PResult<User> {
         preferences: UserPreferences::default(),
         sites: BTreeMap::new(),
         extras: UserExtras::default(),
+        second_factor: Default::default(),
     })
 }
 

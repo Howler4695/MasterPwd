@@ -73,6 +73,8 @@ pub struct UserSummary {
     pub last_used: Timestamp,
     pub preferences: UserPreferences,
     pub site_count: usize,
+    /// Whether the user needs a second factor to unlock, and its slots.
+    pub second_factor: crate::second_factor::SecondFactorStatus,
 }
 
 /// How to write the user's secrets.

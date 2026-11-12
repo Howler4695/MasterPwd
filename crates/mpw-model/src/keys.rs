@@ -18,6 +18,9 @@ use zeroize::Zeroizing;
 pub struct UserKeys {
     full_name: String,
     password: Option<Zeroizing<String>>,
+    /// The typed password when `password` is an effective (second-factor)
+    /// password: the identicon is a typing aid, so it uses what is typed.
+    identicon_from: Option<Zeroizing<String>>,
     keys: [Option<MasterKey>; 4],
     /// The key ID this holder was last successfully authenticated as.
     authenticated: Option<KeyId>,
@@ -32,9 +35,25 @@ impl UserKeys {
         Self {
             full_name: full_name.to_owned(),
             password: Some(Zeroizing::new(master_password.to_owned())),
+            identicon_from: None,
             keys: Default::default(),
             authenticated: None,
         }
+    }
+
+    /// A holder for a user with a second factor: derives keys from the
+    /// effective master password ([`crate::effective_master_password`]:
+    /// `typed_password + " " + recovery code`).  The identicon is still that of
+    /// the typed password.
+    pub fn from_password_and_secret(
+        full_name: &str,
+        typed_password: &str,
+        secret: &crate::SecondSecret,
+    ) -> Self {
+        let effective = crate::second_factor::effective_master_password(typed_password, secret);
+        let mut keys = Self::from_password(full_name, &effective);
+        keys.identicon_from = Some(Zeroizing::new(typed_password.to_owned()));
+        keys
     }
 
     /// A holder for an already-derived key.  More versions can be added with
@@ -44,6 +63,7 @@ impl UserKeys {
         let mut keys = Self {
             full_name: full_name.to_owned(),
             password: None,
+            identicon_from: None,
             keys: Default::default(),
             authenticated: None,
         };
@@ -73,8 +93,9 @@ impl UserKeys {
 
     /// The identicon for the full name and master password, if the password is known.
     pub fn identicon(&self) -> Option<Identicon> {
-        self.password
+        self.identicon_from
             .as_ref()
+            .or(self.password.as_ref())
             .map(|pw| mpw_core::identicon(&self.full_name, pw))
     }
 

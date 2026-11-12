@@ -66,6 +66,7 @@ pub struct User {
     pub preferences: UserPreferences,
     pub(crate) sites: BTreeMap<String, Site>,
     pub(crate) extras: UserExtras,
+    pub(crate) second_factor: crate::second_factor::SecondFactorStatus,
 }
 
 /// A site (a "service" in the original app).
@@ -159,6 +160,7 @@ impl User {
             preferences: UserPreferences::default(),
             sites: BTreeMap::new(),
             extras: UserExtras::default(),
+            second_factor: Default::default(),
         })
     }
 

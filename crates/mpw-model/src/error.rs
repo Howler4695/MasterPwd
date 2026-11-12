@@ -61,6 +61,33 @@ pub enum Error {
     #[error("could not re-encrypt the stored values of {}: {source}", describe_site(site.as_deref()))]
     ReencryptFailed { site: Option<String>, source: Box<Error> },
 
+    // ------------------------------------------------------- second factor
+    /// The user already has a second factor (or, for
+    /// [`crate::User::change_master_password`], use the second-factor variant).
+    #[error("the user has a second factor enabled")]
+    SecondFactorEnabled,
+    #[error("the user has no second factor")]
+    SecondFactorNotEnabled,
+    /// The user's second-factor data is from a newer version or damaged; the
+    /// user can still be unlocked with the recovery code.
+    #[error("the user's second-factor data cannot be read by this version")]
+    SecondFactorUnreadable,
+    /// The given second secret (from a card or a recovery code) is not this user's.
+    #[error("this card or recovery code does not belong to this user")]
+    SecondSecretMismatch,
+    /// The operation would leave the user with no slot; it needs an explicit
+    /// confirmation that the recovery code is saved.
+    #[error("confirm that the recovery code has been saved first")]
+    RecoveryCodeNotConfirmed,
+    #[error("invalid second-factor slot: {0}")]
+    InvalidSlot(&'static str),
+    #[error("no second-factor slot with that id")]
+    NoSuchSlot,
+    #[error("that authenticator is already enrolled")]
+    SlotExists,
+    #[error(transparent)]
+    InvalidRecoveryCode(#[from] crate::second_factor::RecoveryCodeError),
+
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("a user with this full name already exists in the store")]

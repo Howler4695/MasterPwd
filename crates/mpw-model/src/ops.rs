@@ -607,7 +607,18 @@ impl User {
     /// user is unchanged and [`Error::ReencryptFailed`] names the site.  (A
     /// value kept only for switching back to a stateful type that cannot be
     /// decrypted is dropped instead.)  On success `new_keys` unlocks the user.
+    ///
+    /// A user with a second factor is refused ([`Error::SecondFactorEnabled`]):
+    /// use [`User::change_master_password_with_second_factor`].
     pub fn change_master_password(&mut self, old_keys: &mut UserKeys, new_keys: &mut UserKeys) -> Result<()> {
+        if self.second_factor.is_enabled() {
+            return Err(Error::SecondFactorEnabled);
+        }
+        self.rekey(old_keys, new_keys)
+    }
+
+    /// [`User::change_master_password`] without the second-factor guard.
+    pub(crate) fn rekey(&mut self, old_keys: &mut UserKeys, new_keys: &mut UserKeys) -> Result<()> {
         self.check_unlocked(old_keys)?;
         if new_keys.full_name() != self.full_name {
             return Err(Error::UserMismatch);

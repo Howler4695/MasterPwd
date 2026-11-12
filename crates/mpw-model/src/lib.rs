@@ -57,6 +57,7 @@ mod keys;
 mod merge;
 mod model;
 mod ops;
+pub mod second_factor;
 mod store;
 mod time;
 
@@ -66,6 +67,10 @@ pub use keys::UserKeys;
 pub use merge::{merge, MergeSummary};
 pub use model::{sort_most_recent_first, Question, Site, User, UserPreferences};
 pub use ops::{Authentication, ResultRequest};
+pub use second_factor::{
+    effective_master_password, RecoveryCode, RecoveryCodeError, SecondFactor, SecondFactorStatus, SecondSecret, Slot,
+    SlotKind,
+};
 pub use store::{decode_name, encode_name, export_to, read_user_file, Listing, StoredUser, UserStore};
 pub use time::Timestamp;
 
