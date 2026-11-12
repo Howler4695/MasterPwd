@@ -519,3 +519,219 @@ fn flat_file_matches_the_reference_layout() {
     };
     assert_eq!(header(&text), header(&fixture));
 }
+
+// ------------------------------------------------------------------ round 3
+
+const K512: &str =
+    "+ReEtX5rzMxoi4LS2gMV/K6RdDnjD1Sp+MjdfdsN8ZP0GdmooKyM2QTpgsLLKZ7a5hjMxPzcxNRnCdcEj6Rd3g==";
+
+/// The `(state) X => ` line the CLI prints when it stores a value.
+fn printed_state(o: &Output) -> String {
+    let err = stderr(o);
+    err.split("(state) ")
+        .nth(1)
+        .and_then(|rest| rest.split(" =>").next())
+        .unwrap_or_else(|| panic!("no state line: {err}"))
+        .to_owned()
+}
+
+#[test]
+fn device_private_values_are_remembered_but_never_exported() {
+    use mpw_model::{ExportMode, Format, UserKeys};
+    let home = Home::new();
+    let o = home.run(
+        &["-u", NAME, "-t", "D", "dev.example"],
+        &format!("{PASSWORD}\ndevpw\n"),
+    );
+    ok(&o, "devpw");
+    assert!(
+        stderr(&o).contains("Your device-private password: "),
+        "{}",
+        stderr(&o)
+    );
+    let state = printed_state(&o);
+
+    // Remembered: no prompt, nothing but the master password on stdin.
+    let o = home.mpw(&["dev.example"]);
+    ok(&o, "devpw");
+    assert!(!stderr(&o).contains("device-private password:"));
+
+    // The device's own file holds it encrypted, never in clear text.
+    let path = json_path(&home);
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(text.contains(&state) && !text.contains("devpw"), "{text}");
+
+    // An export of that user (what leaves the device) has no trace of it.
+    let mut keys = UserKeys::from_password(NAME, PASSWORD);
+    let user = mpw_model::read_user_file(&path)
+        .unwrap()
+        .load(&mut keys)
+        .unwrap();
+    let redacted = mpw_model::write(&user, Format::Json, ExportMode::Redacted).unwrap();
+    assert!(!redacted.contains(&state) && !redacted.contains("devpw"));
+    let revealed = mpw_model::write(&user, Format::Json, ExportMode::Revealed(&mut keys)).unwrap();
+    assert!(!revealed.contains(&state) && !revealed.contains("devpw"));
+
+    // An explicit -R 0 file is such an export: no device value, a warning,
+    // and the value is forgotten afterwards.
+    let o = home.mpw(&["-R", "0", "dev.example"]);
+    ok(&o, "devpw");
+    assert!(stderr(&o).contains("will be forgotten"), "{}", stderr(&o));
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(!text.contains(&state) && !text.contains("devpw"), "{text}");
+    let o = home.mpw(&["dev.example"]);
+    assert_eq!(o.status.code(), Some(65));
+    assert!(
+        stderr(&o).contains("Missing device-private password."),
+        "{}",
+        stderr(&o)
+    );
+
+    // The flat format carries it too (it is this device's own file).
+    let home = Home::new();
+    let o = home.run(
+        &["-u", NAME, "-F", "flat", "-t", "D", "dev.example"],
+        &format!("{PASSWORD}\ndevpw\n"),
+    );
+    ok(&o, "devpw");
+    ok(&home.mpw(&["-F", "flat", "dev.example"]), "devpw");
+}
+
+#[test]
+fn device_private_login_names() {
+    let home = Home::new();
+    let o = home.run(
+        &["-u", NAME, "-p", "i", "-t", "D", SITE],
+        &format!("{PASSWORD}\nsecret-login\n"),
+    );
+    ok(&o, "secret-login");
+    assert!(
+        stderr(&o).contains("Your device-private login name: "),
+        "{}",
+        stderr(&o)
+    );
+    ok(&home.mpw(&["-p", "i", SITE]), "secret-login");
+    let text = fs::read_to_string(json_path(&home)).unwrap();
+    assert!(!text.contains("secret-login"), "{text}");
+
+    // Switching to a template: the stored login is kept in memory, but files
+    // (like the reference's) only carry a login while its type is stateful,
+    // so switching back in a later run asks for the value again.
+    ok(&home.mpw(&["-p", "i", "-t", "n", SITE]), "wohzaqage");
+    let o = home.run(
+        &["-u", NAME, "-p", "i", "-t", "D", SITE],
+        &format!("{PASSWORD}\nnew-login\n"),
+    );
+    ok(&o, "new-login");
+    ok(&home.mpw(&["-p", "i", SITE]), "new-login");
+
+    // Device-private answers, too.
+    let o = home.run(
+        &["-u", NAME, "-p", "r", "-C", "mother", "-t", "D", SITE],
+        &format!("{PASSWORD}\nSmith\n"),
+    );
+    ok(&o, "Smith");
+    ok(&home.mpw(&["-p", "r", "-C", "mother", SITE]), "Smith");
+}
+
+#[test]
+fn key_context_for_passwords_and_logins() {
+    use mpw_core::{AlgorithmVersion, KeyPurpose, MasterKey, ResultType};
+    let key = MasterKey::derive(NAME, PASSWORD, AlgorithmVersion::V3).unwrap();
+    let expect = |purpose, t| {
+        key.site_result(SITE, 1, purpose, Some("ctx"), t, None)
+            .unwrap()
+            .to_string()
+    };
+    let password = expect(KeyPurpose::Authentication, ResultType::TemplateLong);
+    let login = expect(KeyPurpose::Identification, ResultType::TemplateName);
+    assert_ne!(password, "Jejr5[RepuSosp");
+
+    let home = Home::new();
+    ok(&home.mpw(&["-C", "ctx", SITE]), &password);
+    ok(&home.mpw(&["-p", "i", "-C", "ctx", SITE]), &login);
+    // The context is per call, not stored.
+    ok(&home.mpw(&[SITE]), "Jejr5[RepuSosp");
+    ok(&home.mpw(&["-p", "i", SITE]), "wohzaqage");
+}
+
+#[test]
+fn derived_keys() {
+    let home = Home::new();
+    ok(
+        &home.mpw(&["-t", "K", "-P", "256", SITE]),
+        "TCFYP7cKH8FQ8WYwILAlSfqAcz14K0yPGYV3sBvuyQA=",
+    );
+    ok(&home.mpw(&["-t", "K", "-P", "0", SITE]), K512);
+    ok(&home.mpw(&["-t", "key", "-P", "512", SITE]), K512);
+    assert_eq!(
+        home.mpw(&["-t", "K", "-P", "abc", SITE]).status.code(),
+        Some(64)
+    );
+    assert_eq!(
+        home.mpw(&["-t", "K", "-P", "100", SITE]).status.code(),
+        Some(70)
+    );
+    assert_eq!(home.mpw(&["-t", "K", SITE]).status.code(), Some(70));
+    // Not persisted as the site's type.
+    ok(&home.mpw(&[SITE]), "Jejr5[RepuSosp");
+    assert!(!fs::read_to_string(json_path(&home))
+        .unwrap()
+        .contains("4160"));
+}
+
+#[test]
+fn capital_u_keeps_unknown_members_and_is_all_or_nothing() {
+    let home = Home::new();
+    ok(
+        &home.mpw(&["-t", "P", "-P", "my personal pw", "personal.example"]),
+        "my personal pw",
+    );
+    let path = json_path(&home);
+    let text = fs::read_to_string(&path).unwrap();
+    let text = text.replacen(
+        "\"avatar\": 0,",
+        "\"avatar\": 0,\n    \"x_custom_member\": \"keep me\",",
+        1,
+    );
+    assert!(text.contains("x_custom_member"));
+    fs::write(&path, text).unwrap();
+
+    let o = home.run(
+        &["-U", NAME, "personal.example"],
+        &format!("{OTHER_PASSWORD}\n{PASSWORD}\n"),
+    );
+    ok(&o, "my personal pw");
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(text.contains("\"x_custom_member\": \"keep me\""), "{text}");
+    assert!(!text.contains(KEY_ID), "the key ID changed");
+    let o = home.run(
+        &["-u", NAME, "personal.example"],
+        &format!("{OTHER_PASSWORD}\n"),
+    );
+    ok(&o, "my personal pw");
+
+    // A stored value the old key cannot decrypt: nothing changes.
+    let home = Home::new();
+    let o = home.mpw(&["-t", "P", "-P", "x", "broken.example"]);
+    ok(&o, "x");
+    let state = printed_state(&o);
+    ok(&home.mpw(&[SITE]), "Jejr5[RepuSosp");
+    let path = json_path(&home);
+    let broken = fs::read_to_string(&path)
+        .unwrap()
+        .replace(&state, "AAAAAAAAAAAAAAAAAAAAAA==");
+    fs::write(&path, &broken).unwrap();
+    let before = fs::read(&path).unwrap();
+
+    let o = home.run(
+        &["-U", NAME, SITE],
+        &format!("{OTHER_PASSWORD}\n{PASSWORD}\n"),
+    );
+    assert_eq!(o.status.code(), Some(65), "{}", stderr(&o));
+    assert!(stderr(&o).contains("nothing was changed"), "{}", stderr(&o));
+    assert!(stderr(&o).contains("broken.example"), "{}", stderr(&o));
+    assert!(o.stdout.is_empty());
+    assert_eq!(fs::read(&path).unwrap(), before);
+    ok(&home.mpw(&[SITE]), "Jejr5[RepuSosp");
+}

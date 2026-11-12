@@ -5,9 +5,9 @@
 use crate::input;
 use crate::log::{dbg_log, inf, wrn, Fatal};
 use crate::store::{self, Location};
-use crate::{EX_DATAERR, EX_SOFTWARE};
+use crate::{EX_DATAERR, EX_SOFTWARE, EX_USAGE};
 use mpw_core::{AlgorithmVersion, Counter, KeyPurpose, ResultType, COUNTER_INITIAL};
-use mpw_model::{Error as ModelError, ExportMode, User, UserFile, UserKeys};
+use mpw_model::{Error as ModelError, ExportMode, ResultRequest, User, UserFile, UserKeys};
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
@@ -162,20 +162,21 @@ pub fn run(
     let mut result_param = req.result_param;
     if result_type.is_stateful() {
         let value = match result_param.take() {
-            Some(p) if p.as_str() == "-" => {
-                Some(input::get_secret_value(purpose_noun(req.purpose))?)
-            }
+            Some(p) if p.as_str() == "-" => Some(input::get_secret_value(value_noun(
+                req.purpose,
+                result_type,
+            ))?),
             Some(p) => {
                 wrn!(
                     "Warning: a {} given with -P is visible to other users (ps) and in shell history; \
                      omit -P (or use -P -) to be prompted instead.",
-                    purpose_noun(req.purpose)
+                    value_noun(req.purpose, result_type)
                 );
                 Some(p)
             }
-            None if !has_stored_value(user, site_name, req.purpose, &keyword) => {
-                Some(input::get_secret_value(purpose_noun(req.purpose))?)
-            }
+            None if !has_stored_value(user, site_name, req.purpose, &keyword) => Some(
+                input::get_secret_value(value_noun(req.purpose, result_type))?,
+            ),
             None => None,
         };
         if let Some(value) = value {
@@ -189,23 +190,8 @@ pub fn run(
                 &value,
             )?;
             // The reference shows the new (encrypted) state.
-            let state = keys
-                .key(algorithm)
-                .map_err(data_err("Couldn't derive master key"))?
-                .site_state(
-                    site_name,
-                    counter,
-                    req.purpose,
-                    context_for(req.purpose, &keyword, req.key_context.as_deref()),
-                    result_type,
-                    &value,
-                )
-                .map_err(|e| {
-                    Fatal::new(EX_SOFTWARE, format!("Couldn't encrypt site result: {e}"))
-                })?;
-            inf!("(state) {state} => ");
-            if result_type.is_device_private() && session.location.is_some() {
-                wrn!("Note: device-private values are never written to user files; it will not be remembered.");
+            if let Some(state) = stored_state(user, site_name, req.purpose, &keyword) {
+                inf!("(state) {state} => ");
             }
         }
     }
@@ -219,8 +205,6 @@ pub fn run(
         &keyword,
         req.key_context.as_deref(),
         result_type,
-        counter,
-        algorithm,
         result_param.as_ref().map(|p| p.as_str()),
     )?;
     on_result(&Outcome {
@@ -234,23 +218,16 @@ pub fn run(
     save(&mut session, keys, &req.files)
 }
 
-fn purpose_noun(purpose: KeyPurpose) -> &'static str {
+/// What the stored value is called in prompts and messages.
+fn value_noun(purpose: KeyPurpose, result_type: ResultType) -> &'static str {
+    let device = result_type.is_device_private();
     match purpose {
+        KeyPurpose::Authentication if device => "device-private password",
         KeyPurpose::Authentication => "personal password",
+        KeyPurpose::Identification if device => "device-private login name",
         KeyPurpose::Identification => "login name",
+        KeyPurpose::Recovery if device => "device-private answer",
         KeyPurpose::Recovery => "answer",
-    }
-}
-
-/// The key context the reference passes to the algorithm.
-fn context_for<'a>(
-    purpose: KeyPurpose,
-    keyword: &'a str,
-    context: Option<&'a str>,
-) -> Option<&'a str> {
-    match purpose {
-        KeyPurpose::Recovery => Some(keyword).filter(|k| !k.is_empty()),
-        _ => context.filter(|c| !c.is_empty()),
     }
 }
 
@@ -358,7 +335,7 @@ fn update_master_password(
         let mut old_keys = UserKeys::from_password(&name, &old);
         drop(old);
         match file.load(&mut old_keys) {
-            Ok(old_user) => return rekey(&old_user, &mut old_keys, new_keys),
+            Ok(old_user) => return rekey(old_user, &mut old_keys, new_keys),
             Err(ModelError::WrongMasterPassword) => inf!("Incorrect old master password."),
             Err(e) => return Err(data_err("Couldn't load the configuration")(e)),
         }
@@ -366,40 +343,17 @@ fn update_master_password(
     Err(incorrect_password(path))
 }
 
-/// Build a copy of `old` keyed to `new_keys`, re-encrypting every stored value.
-///
-/// mpw-model has no "change master password" operation, so this is assembled
-/// from public pieces: a new user adopting the new key, the old user's
-/// settings, and `merge` for the sites (which re-encrypts).
-fn rekey(old: &User, old_keys: &mut UserKeys, new_keys: &mut UserKeys) -> Result<User, Fatal> {
-    let err = data_err("Couldn't move the user to the new master password");
-    let mut user = User::new(old.full_name()).map_err(&err)?;
-    user.authenticate(new_keys).map_err(&err)?;
-    user.set_algorithm(new_keys, old.algorithm())
-        .map_err(&err)?;
-    user.avatar = old.avatar;
-    user.default_type = old.default_type;
-    user.preferences = old.preferences.clone();
-    let login_type = old.login_type();
-    if login_type.is_stateful() {
-        if old.has_login_state() {
-            let login = old.user_login(old_keys).map_err(&err)?;
-            user.set_user_login_name(new_keys, &login).map_err(&err)?;
-        }
-    } else {
-        user.set_generated_login(login_type).map_err(&err)?;
-    }
-    let summary = mpw_model::merge(&mut user, new_keys, old, old_keys).map_err(&err)?;
-    if !summary.skipped.is_empty() {
-        return Err(Fatal::new(
-            EX_DATAERR,
-            format!(
-                "Couldn't re-encrypt the stored values of {} site(s); nothing was changed.",
-                summary.skipped.len()
-            ),
-        ));
-    }
-    user.last_used = old.last_used;
+/// Move the user loaded with `old_keys` to `new_keys` (all or nothing).
+fn rekey(mut user: User, old_keys: &mut UserKeys, new_keys: &mut UserKeys) -> Result<User, Fatal> {
+    user.change_master_password(old_keys, new_keys)
+        .map_err(|e| {
+            Fatal::new(
+                EX_DATAERR,
+                format!(
+                    "Couldn't move the user to the new master password; nothing was changed: {e}"
+                ),
+            )
+        })?;
     inf!("The configuration now uses the new master password.");
     Ok(user)
 }
@@ -418,11 +372,17 @@ fn set_type(
         .ok_or_else(|| Fatal::new(EX_SOFTWARE, "The site disappeared."))?;
     match purpose {
         KeyPurpose::Authentication => site.result_type = t,
-        // Stateful login types are set together with their value (store_value).
         KeyPurpose::Identification if t.is_template() => site
             .set_generated_login(t)
             .map_err(data_err("Couldn't set the login type"))?,
-        KeyPurpose::Identification => {}
+        // Switch back to a login stored earlier; without one, the value is
+        // asked for and stored together with the type (store_value).
+        KeyPurpose::Identification => {
+            if site.has_login_state() {
+                site.use_stored_login(t)
+                    .map_err(data_err("Couldn't set the login type"))?;
+            }
+        }
         KeyPurpose::Recovery => {
             if let Some(q) = site.question_mut(keyword) {
                 q.result_type = t;
@@ -462,20 +422,27 @@ fn store_value(
         KeyPurpose::Authentication => user
             .set_site_password(keys, site_name, result_type, value)
             .map_err(err),
-        _ if result_type != ResultType::StatefulPersonal => Err(Fatal::new(
-            EX_DATAERR,
-            format!(
-                "Only personal ({}) values can be stored for {}.",
-                ResultType::StatefulPersonal.abbreviation(),
-                purpose_noun(purpose)
-            ),
-        )),
         KeyPurpose::Identification => user
-            .set_site_login_name(keys, site_name, value)
+            .store_site_login(keys, site_name, result_type, value)
             .map_err(err),
         KeyPurpose::Recovery => user
-            .set_answer(keys, site_name, keyword, value)
+            .store_answer(keys, site_name, keyword, result_type, value)
             .map_err(err),
+    }
+}
+
+/// The stored (encrypted) value for the purpose, as the model holds it.
+fn stored_state<'u>(
+    user: &'u User,
+    site_name: &str,
+    purpose: KeyPurpose,
+    keyword: &str,
+) -> Option<&'u str> {
+    let site = user.site(site_name)?;
+    match purpose {
+        KeyPurpose::Authentication => site.password_state(),
+        KeyPurpose::Identification => site.login_state(),
+        KeyPurpose::Recovery => site.question(keyword)?.answer_state(),
     }
 }
 
@@ -490,41 +457,35 @@ fn result(
     keyword: &str,
     key_context: Option<&str>,
     result_type: ResultType,
-    counter: Counter,
-    algorithm: AlgorithmVersion,
     result_param: Option<&str>,
 ) -> Result<Zeroizing<String>, Fatal> {
     let failed = |e: String| Fatal::new(EX_SOFTWARE, format!("Couldn't generate site result: {e}"));
 
-    // Results the model does not model: derived keys (not persisted), and
-    // template results with a key context for passwords/logins (the reference
-    // passes -C to the algorithm for every purpose; the model only for
-    // answers).  Computed with the site's algorithm, counter and the
-    // authenticated key.
-    let context = context_for(purpose, keyword, key_context);
-    let direct = result_type.is_derive()
-        || (purpose != KeyPurpose::Recovery && context.is_some() && result_type.is_template());
-    if direct {
-        return keys
-            .key(algorithm)
-            .map_err(|e| failed(e.to_string()))?
-            .site_result(
-                site_name,
-                counter,
-                purpose,
-                context,
-                result_type,
-                result_param,
+    // Every stored setting (type, counter, algorithm) has been applied to the
+    // site already; only the per-call parts go into the request.  The
+    // reference passes -C to the algorithm for every purpose.
+    let mut request = match purpose {
+        KeyPurpose::Recovery => ResultRequest::answer(keyword),
+        _ => match key_context.filter(|c| !c.is_empty()) {
+            Some(context) => ResultRequest::new(purpose).context(context),
+            None => ResultRequest::new(purpose),
+        },
+    };
+    if result_type.is_derive() {
+        // A derived key is not persisted as the site's type (an "alternative").
+        let param = result_param.ok_or_else(|| {
+            failed("a key size is required (-P bits, e.g. -P 256; 0 for the default)".into())
+        })?;
+        let bits = param.trim().parse::<u32>().map_err(|_| {
+            Fatal::new(
+                EX_USAGE,
+                format!("Invalid key size: {param} (expected a number of bits)"),
             )
-            .map_err(|e| failed(e.to_string()));
+        })?;
+        request = request.derive_key(Some(bits).filter(|b| *b != 0));
     }
-
-    match purpose {
-        KeyPurpose::Authentication => user.site_password(keys, site_name),
-        KeyPurpose::Identification => user.site_login(keys, site_name),
-        KeyPurpose::Recovery => user.site_answer(keys, site_name, keyword),
-    }
-    .map_err(|e| failed(e.to_string()))
+    user.site_result(keys, site_name, &request)
+        .map_err(|e| failed(e.to_string()))
 }
 
 // ----------------------------------------------------------------- cli_save
@@ -547,11 +508,38 @@ fn save(session: &mut Session, keys: &mut UserKeys, files: &store::Options) -> R
     } else if !session.file_redacted && files.redacted.is_none() {
         wrn!("The configuration file was not redacted; saving it redacted (use -R 0 to keep clear-text passwords).");
     }
+    if revealed && has_device_private(&session.user) {
+        wrn!("Warning: device-private values are never written in clear text; they are not in this file and will be forgotten.");
+    }
+    if format == store::Format::Flat && flat_loses_data(&session.user) {
+        wrn!("Warning: the flat format cannot store security questions, URLs or site login-name types; they are not saved.  Use -F json to keep them.");
+    }
+    // This is the device's own store: device-private values are kept (encrypted).
     let mode = if revealed {
         ExportMode::Revealed(keys)
     } else {
-        ExportMode::Redacted
+        ExportMode::Storage
     };
     location.save(&session.user, format, mode)?;
     Ok(())
+}
+
+fn has_device_private(user: &User) -> bool {
+    user.login_type().is_device_private()
+        || user.sites().any(|s| {
+            s.result_type.is_device_private()
+                || s.login_type().is_some_and(ResultType::is_device_private)
+                || s.questions().any(|q| q.result_type.is_device_private())
+        })
+}
+
+/// What `.mpsites` (flat format 1) cannot represent.
+fn flat_loses_data(user: &User) -> bool {
+    user.sites().any(|s| {
+        s.questions().next().is_some()
+            || s.url.is_some()
+            || s.login_type().is_some_and(|t| {
+                t != ResultType::DEFAULT_LOGIN && t != ResultType::StatefulPersonal
+            })
+    })
 }
