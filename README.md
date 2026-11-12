@@ -65,8 +65,9 @@ master password, insert the card and enter its PIN in the macOS prompt.
 - Run `"dist/Master Password.app/Contents/MacOS/MasterPwd" --smart-cards` to
   see what the app finds on an inserted card.
 
-This has been tested against software keys only; see the limitations in
-`docs/CHANGES-FROM-ORIGINAL.md`.
+Reading a real DoD CAC has been verified; the PIN prompt and on-card
+decryption have only been tested against software keys. See the limitations
+in `docs/CHANGES-FROM-ORIGINAL.md`.
 
 Build the app bundle:
 

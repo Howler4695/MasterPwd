@@ -123,11 +123,12 @@ how it works). Design decisions:
 
 ## Known limitations of the rewrite
 
-- **The smart card path is untested with a real card.** Encryption and
-  decryption are tested against software keys through the same code. Reading
-  a real card's certificates, the PIN prompt and on-card decryption are
-  unverified, including whether a sandboxed, ad-hoc signed build can read a
-  card's keychain items at all. `--smart-cards` reports what the app sees.
+- **The smart card path is only partly tested with a real card.** Reading a
+  DoD CAC from the sandboxed, ad-hoc signed app works: it finds the card's
+  certificates and selects the key-encipherment one. The PIN prompt and
+  on-card decryption have not been exercised; encryption and decryption are
+  tested against software keys through the same code. `--smart-cards`
+  reports what the app sees.
 - Passkeys are not supported: Apple's API needs a Developer ID signature and
   an associated domain. The slot format leaves room for other authenticators.
 
