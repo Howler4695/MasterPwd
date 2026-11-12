@@ -17,11 +17,17 @@ path = "src/main.rs"
 
 [dependencies]
 mpw-core = { path = "../mpw-core" }
-# mpw-model is wired in next round, behind `data::DataStore`.
+mpw-model = { path = "../mpw-model" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-dispatch2 = { version = "0.3", default-features = false, features = ["std"] }
+block2 = "0.6"
+objc2-local-authentication = { version = "0.3", default-features = false, features = [
+    "std",
+    "block2",
+    "LAContext",
+    "LAError",
+] }
 security-framework = { version = "3", features = ["OSX_10_15"] }
 objc2-service-management = { version = "0.3", default-features = false, features = [
     "std",
@@ -31,28 +37,47 @@ objc2-service-management = { version = "0.3", default-features = false, features
 ] }
 objc2-foundation = { version = "0.3", default-features = false, features = [
     "std",
+    "block2",
     "NSArray",
     "NSBundle",
     "NSData",
     "NSDate",
+    "NSDictionary",
     "NSDistributedNotificationCenter",
     "NSEnumerator",
     "NSError",
     "NSGeometry",
+    "NSIndexSet",
     "NSNotification",
+    "NSRange",
     "NSObject",
     "NSProcessInfo",
     "NSRunLoop",
     "NSString",
+    "NSTimer",
+    "NSURL",
     "NSUserDefaults",
     "NSValue",
 ] }
 objc2-app-kit = { version = "0.3", default-features = false, features = [
     "std",
     "objc2-core-foundation",
+    "NSAccessibilityProtocols",
     "NSAlert",
+    "NSClipView",
     "NSFontDescriptor",
+    "NSImageCell",
     "NSImageView",
+    "NSOpenPanel",
+    "NSPanel",
+    "NSParagraphStyle",
+    "NSSavePanel",
+    "NSScreen",
+    "NSScrollView",
+    "NSTableColumn",
+    "NSTableHeaderView",
+    "NSTableView",
+    "NSUserInterfaceItemIdentification",
     "NSApplication",
     "NSButton",
     "NSButtonCell",

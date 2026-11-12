@@ -130,7 +130,7 @@ cat > "$CONTENTS/Info.plist" <<PLIST
 			<key>CFBundleTypeRole</key>
 			<string>Viewer</string>
 			<key>LSHandlerRank</key>
-			<string>Alternate</string>
+			<string>Owner</string>
 			<key>LSTypeIsPackage</key>
 			<false/>
 			<key>LSItemContentTypes</key>
@@ -144,7 +144,7 @@ cat > "$CONTENTS/Info.plist" <<PLIST
 			<key>CFBundleTypeRole</key>
 			<string>Viewer</string>
 			<key>LSHandlerRank</key>
-			<string>Alternate</string>
+			<string>Owner</string>
 			<key>LSTypeIsPackage</key>
 			<false/>
 			<key>LSItemContentTypes</key>

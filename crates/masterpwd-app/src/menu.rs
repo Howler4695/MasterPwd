@@ -13,6 +13,8 @@ pub enum MenuCommand {
     ToggleSavePassword,
     ClipboardClear(u32),
     IdleLock(u32),
+    /// Index into the user list.
+    SelectUser(u32),
     NewUser,
     DeleteUser,
     ImportSites,
@@ -23,6 +25,7 @@ pub enum MenuCommand {
 
 const PARAM_CLIPBOARD: isize = 100_000;
 const PARAM_IDLE: isize = 200_000;
+const PARAM_USER: isize = 300_000;
 const PARAM_SPAN: isize = 100_000;
 
 impl MenuCommand {
@@ -47,6 +50,7 @@ impl MenuCommand {
         match self {
             Self::ClipboardClear(s) => PARAM_CLIPBOARD + (s as isize).min(PARAM_SPAN - 1),
             Self::IdleLock(m) => PARAM_IDLE + (m as isize).min(PARAM_SPAN - 1),
+            Self::SelectUser(i) => PARAM_USER + (i as isize).min(PARAM_SPAN - 1),
             simple => Self::SIMPLE.iter().find(|(c, _)| *c == simple).map_or(0, |(_, t)| *t),
         }
     }
@@ -59,6 +63,9 @@ impl MenuCommand {
             }
             t if (PARAM_IDLE..PARAM_IDLE + PARAM_SPAN).contains(&t) => {
                 Some(Self::IdleLock((t - PARAM_IDLE) as u32))
+            }
+            t if (PARAM_USER..PARAM_USER + PARAM_SPAN).contains(&t) => {
+                Some(Self::SelectUser((t - PARAM_USER) as u32))
             }
             t => Self::SIMPLE.iter().find(|(_, x)| *x == t).map(|(c, _)| *c),
         }
@@ -169,7 +176,13 @@ mod tests {
         let all = MenuCommand::SIMPLE
             .iter()
             .map(|(c, _)| *c)
-            .chain([MenuCommand::ClipboardClear(0), MenuCommand::ClipboardClear(60), MenuCommand::IdleLock(15)]);
+            .chain([
+                MenuCommand::ClipboardClear(0),
+                MenuCommand::ClipboardClear(60),
+                MenuCommand::IdleLock(15),
+                MenuCommand::SelectUser(0),
+                MenuCommand::SelectUser(7),
+            ]);
         for c in all {
             assert!(c.tag() > 0);
             assert_eq!(MenuCommand::from_tag(c.tag()), Some(c), "{c:?}");

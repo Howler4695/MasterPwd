@@ -5,11 +5,16 @@
 //! [`crate::core::AppCore`], and its state is rendered back.
 
 pub mod app;
+pub mod avatars;
+pub mod cgwindow;
+pub mod dialogs;
 pub mod defaults;
 pub mod hotkey;
 pub mod keychain;
+pub mod local_auth;
 pub mod login_item;
 pub mod pasteboard;
+pub mod runloop;
 pub mod sites_window;
 pub mod smoke;
 pub mod status_item;

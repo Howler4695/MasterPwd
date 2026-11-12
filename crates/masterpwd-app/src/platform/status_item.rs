@@ -5,11 +5,37 @@ use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{sel, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSControlStateValueOff, NSControlStateValueOn, NSEventModifierFlags, NSImage, NSMenu, NSMenuDelegate,
-    NSMenuItem, NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
+    NSAccessibility, NSMenuItem, NSScreen, NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
 };
 
 use super::ns;
 use crate::menu::{MenuEntry, MenuItem};
+
+/// WindowServer's status-bar window level (`kCGStatusWindowLevel`).
+const STATUS_LAYER: i64 = 25;
+
+/// Where the status item is.  On macOS 26 status items are drawn by Control
+/// Center: WindowServer lists a Control Center–owned window at the status
+/// level with our item's frame (and reports *every* menu-bar item, the clock
+/// included, as not "on screen"), so "visible" here means: AppKit says it is
+/// visible, a status-level window with exactly our frame exists, the frame is
+/// on a screen, and it is not hidden behind the camera notch.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Placement {
+    /// x, y, width, height in WindowServer coordinates.
+    pub frame: (f64, f64, f64, f64),
+    /// (owner pid, window number) of the status-level window at our frame.
+    pub hosted_by: Option<(i64, i64)>,
+    pub on_a_screen: bool,
+    pub under_notch: bool,
+    pub app_kit_visible: bool,
+}
+
+impl Placement {
+    pub fn is_visible(&self) -> bool {
+        self.app_kit_visible && self.hosted_by.is_some() && self.on_a_screen && !self.under_notch
+    }
+}
 
 pub struct StatusItem {
     pub item: Retained<NSStatusItem>,
@@ -32,6 +58,12 @@ impl StatusItem {
         menu.setAutoenablesItems(false);
         menu.setDelegate(Some(delegate));
         item.setMenu(Some(&menu));
+        item.setAutosaveName(Some(&ns("MasterPassword")));
+        item.setVisible(true);
+        if let Some(button) = item.button(mtm) {
+            button.setAccessibilityLabel(Some(&ns("Master Password")));
+            button.setAccessibilityTitle(Some(&ns("Master Password")));
+        }
         let this = Self { item, menu, mtm };
         this.set_locked(true);
         this
@@ -51,6 +83,47 @@ impl StatusItem {
                 "Master Password (unlocked) — ⌃⌘P"
             })));
         }
+    }
+
+    /// Is the status item really in the menu bar?  See [`Placement`].
+    pub fn placement(&self) -> Option<Placement> {
+        let window = self.item.button(self.mtm)?.window()?;
+        let frame = window.frame();
+        let screens = NSScreen::screens(self.mtm);
+        let main_height = screens.iter().next().map_or(0.0, |s| s.frame().size.height);
+        // AppKit: bottom-left origin; WindowServer: top-left origin of the
+        // primary screen.
+        let cg = (frame.origin.x, main_height - frame.origin.y - frame.size.height, frame.size.width, frame.size.height);
+        let close = |a: f64, b: f64| (a - b).abs() <= 1.0;
+        let hosted = super::cgwindow::all_windows().into_iter().find(|w| {
+            w.layer == STATUS_LAYER
+                && close(w.bounds.0, cg.0)
+                && close(w.bounds.1, cg.1)
+                && close(w.bounds.2, cg.2)
+                && close(w.bounds.3, cg.3)
+        });
+        let screen = screens.iter().find(|s| {
+            let f = s.frame();
+            let mid = frame.origin.x + frame.size.width / 2.0;
+            mid >= f.origin.x && mid <= f.origin.x + f.size.width
+        });
+        let (on_a_screen, under_notch) = match &screen {
+            Some(s) => {
+                let (left, right) = (s.auxiliaryTopLeftArea(), s.auxiliaryTopRightArea());
+                let has_notch = left.size.width > 0.0 && right.size.width > 0.0;
+                let gap = (left.origin.x + left.size.width, right.origin.x);
+                let (x0, x1) = (frame.origin.x, frame.origin.x + frame.size.width);
+                (true, has_notch && x1 > gap.0 && x0 < gap.1)
+            }
+            None => (false, false),
+        };
+        Some(Placement {
+            frame: cg,
+            hosted_by: hosted.map(|w| (w.pid, w.number)),
+            on_a_screen,
+            under_notch,
+            app_kit_visible: self.item.isVisible(),
+        })
     }
 
     pub fn has_button(&self) -> bool {

@@ -164,6 +164,56 @@ impl Keychain {
     }
 }
 
+impl crate::keys::KeyVault for Keychain {
+    fn store_all(&self, full_name: &str, keys: &mut mpw_model::UserKeys) -> Result<String, String> {
+        let mut backend = Backend::File;
+        for v in AlgorithmVersion::ALL {
+            let bytes = keys.key_bytes(v).map_err(|e| e.to_string())?;
+            let key = MasterKey::from_bytes(*bytes, v);
+            backend = self.store(full_name, &key).map_err(|e| {
+                let _ = self.delete_all_versions(full_name);
+                e.to_string()
+            })?;
+        }
+        Ok(match backend {
+            Backend::DataProtection => "data-protection Keychain".into(),
+            Backend::File => "login Keychain".into(),
+        })
+    }
+
+    fn load_all(&self, full_name: &str) -> Result<Option<mpw_model::UserKeys>, String> {
+        let mut out: Option<mpw_model::UserKeys> = None;
+        for v in AlgorithmVersion::ALL {
+            if let Some(key) = self.load(full_name, v).map_err(|e| e.to_string())? {
+                match &mut out {
+                    Some(o) => o.insert_key(key),
+                    None => out = Some(mpw_model::UserKeys::from_key(full_name, key)),
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn delete_all(&self, full_name: &str) -> Result<(), String> {
+        self.delete_all_versions(full_name).map_err(|e| e.to_string())
+    }
+}
+
+impl Keychain {
+    /// Delete the keys of every algorithm version.
+    pub fn delete_all_versions(&self, user: &str) -> Result<(), KeychainError> {
+        for v in AlgorithmVersion::ALL {
+            self.delete(user, v)?;
+        }
+        Ok(())
+    }
+
+    /// Whether anything is stored for `user` (smoke test).
+    pub fn has_any(&self, user: &str) -> bool {
+        AlgorithmVersion::ALL.into_iter().any(|v| matches!(self.load(user, v), Ok(Some(_))))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
