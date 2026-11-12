@@ -56,6 +56,11 @@ pub enum Error {
     #[error("this export contains clear-text passwords; the master password is needed to import it")]
     RevealedNeedsKey,
 
+    /// [`crate::User::change_master_password`] could not re-encrypt a stored
+    /// value.  `site` is `None` for the user-level login name.  Nothing changed.
+    #[error("could not re-encrypt the stored values of {}: {source}", describe_site(site.as_deref()))]
+    ReencryptFailed { site: Option<String>, source: Box<Error> },
+
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("a user with this full name already exists in the store")]
@@ -72,6 +77,10 @@ pub enum Error {
     /// `$HOME` is not set, so there is no default store directory.
     #[error("cannot determine the home directory")]
     NoHomeDirectory,
+}
+
+fn describe_site(site: Option<&str>) -> String {
+    site.map_or_else(|| "the user's login name".to_owned(), |s| format!("site {s:?}"))
 }
 
 /// What went wrong while parsing, and where.

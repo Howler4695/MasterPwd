@@ -170,14 +170,8 @@ impl User {
         if algorithm == self.algorithm {
             return Ok(());
         }
-        let new_state = match (&self.login_state, self.login_type.is_stateful()) {
-            (Some(state), true) => {
-                let plain = self.login_ctx().decrypt(keys, state)?;
-                let ctx = StateCtx { algorithm, ..self.login_ctx() };
-                Some(ctx.encrypt(keys, &plain)?)
-            }
-            _ => None,
-        };
+        let dst = StateCtx { algorithm, ..self.login_ctx() };
+        let new_state = reencrypt_state(self.login_ctx(), dst, self.login_state.as_deref(), keys, None)?;
         let id = keys.key(algorithm)?.key_id();
         self.algorithm = algorithm;
         self.login_state = new_state;
@@ -292,11 +286,23 @@ impl User {
 
     /// Store a personal login name for the site.
     pub fn set_site_login_name(&mut self, keys: &mut UserKeys, site: &str, login: &str) -> Result<()> {
+        self.store_site_login(keys, site, ResultType::StatefulPersonal, login)
+    }
+
+    /// Store a login name for the site as `stateful_type`
+    /// ([`ResultType::StatefulPersonal`] or [`ResultType::StatefulDevice`]).
+    pub fn store_site_login(
+        &mut self,
+        keys: &mut UserKeys,
+        site: &str,
+        stateful_type: ResultType,
+        login: &str,
+    ) -> Result<()> {
         self.check_unlocked(keys)?;
-        let t = ResultType::StatefulPersonal;
-        let state = self.site_ref(site)?.login_ctx(t).encrypt(keys, login)?;
+        require_stateful(stateful_type)?;
+        let state = self.site_ref(site)?.login_ctx(stateful_type).encrypt(keys, login)?;
         if let Some(s) = self.sites.get_mut(site) {
-            s.login_type = Some(t);
+            s.login_type = Some(stateful_type);
             s.login_state = Some(state);
         }
         Ok(())
@@ -304,29 +310,57 @@ impl User {
 
     /// Store a personal login name for the user (used by sites without their own).
     pub fn set_user_login_name(&mut self, keys: &mut UserKeys, login: &str) -> Result<()> {
+        self.store_user_login(keys, ResultType::StatefulPersonal, login)
+    }
+
+    /// Store the user-level login name as `stateful_type` (personal or device).
+    pub fn store_user_login(&mut self, keys: &mut UserKeys, stateful_type: ResultType, login: &str) -> Result<()> {
         self.check_unlocked(keys)?;
-        let ctx = StateCtx { result_type: ResultType::StatefulPersonal, ..self.login_ctx() };
+        require_stateful(stateful_type)?;
+        let ctx = StateCtx { result_type: stateful_type, ..self.login_ctx() };
         let state = ctx.encrypt(keys, login)?;
-        self.login_type = ResultType::StatefulPersonal;
+        self.login_type = stateful_type;
         self.login_state = Some(state);
         Ok(())
     }
 
-    /// Generate the user's login name from a template again (drops a stored one).
+    /// Switch the user's login back to a stored value of type `stateful_type`,
+    /// reusing the login name stored earlier (see [`User::set_generated_login`]).
+    pub fn use_stored_login(&mut self, stateful_type: ResultType) -> Result<()> {
+        require_stateful(stateful_type)?;
+        self.login_type = stateful_type;
+        Ok(())
+    }
+
+    /// Generate the user's login name from a template again.  A stored login
+    /// name is kept (unused) so that switching back restores it, like the reference.
     pub fn set_generated_login(&mut self, template: ResultType) -> Result<()> {
         if !template.is_template() {
             return Err(Error::NotStateful(template));
         }
         self.login_type = template;
-        self.login_state = None;
         Ok(())
     }
 
     /// Store a personal answer for a site's question, creating the question if needed.
     pub fn set_answer(&mut self, keys: &mut UserKeys, site: &str, keyword: &str, answer: &str) -> Result<()> {
+        self.store_answer(keys, site, keyword, ResultType::StatefulPersonal, answer)
+    }
+
+    /// Store an answer as `stateful_type` (personal or device), creating the
+    /// question if needed.
+    pub fn store_answer(
+        &mut self,
+        keys: &mut UserKeys,
+        site: &str,
+        keyword: &str,
+        stateful_type: ResultType,
+        answer: &str,
+    ) -> Result<()> {
         self.check_unlocked(keys)?;
         validate_keyword(keyword)?;
-        let t = ResultType::StatefulPersonal;
+        require_stateful(stateful_type)?;
+        let t = stateful_type;
         let state = self.site_ref(site)?.answer_ctx(keyword, t).encrypt(keys, answer)?;
         let s = self.sites.get_mut(site).ok_or(Error::NoSuchSite)?;
         let q = match s.questions.get_mut(keyword) {
@@ -360,6 +394,41 @@ fn require_stateful(t: ResultType) -> Result<()> {
     }
 }
 
+fn as_stateful(c: StateCtx<'_>) -> StateCtx<'_> {
+    if c.result_type.is_stateful() {
+        c
+    } else {
+        StateCtx { result_type: ResultType::StatefulPersonal, ..c }
+    }
+}
+
+/// Re-encrypt one stored value from `src` (with `from`) to `dst` (with `to`, or
+/// `from` again).  A value kept while a template type is selected ("stale") is
+/// converted too, as a personal value; if it cannot be, it is dropped rather
+/// than failing the operation.  A live value that cannot be converted is an error.
+pub(crate) fn reencrypt_state(
+    src: StateCtx<'_>,
+    dst: StateCtx<'_>,
+    state: Option<&str>,
+    from: &mut UserKeys,
+    to: Option<&mut UserKeys>,
+) -> Result<Option<String>> {
+    let Some(state) = state else { return Ok(None) };
+    let live = src.result_type.is_stateful();
+    let converted = as_stateful(src).decrypt(from, state).and_then(|plain| {
+        let dst_keys = match to {
+            Some(t) => t,
+            None => from,
+        };
+        as_stateful(dst).encrypt(dst_keys, &plain)
+    });
+    match converted {
+        Ok(s) => Ok(Some(s)),
+        Err(e) if live => Err(e),
+        Err(_) => Ok(None),
+    }
+}
+
 /// Re-encrypt every live stored value of `source` into `target` (which has the
 /// same name and questions but possibly another algorithm), decrypting with
 /// `from` and encrypting with `to` (or `from` again if `to` is `None`).
@@ -371,22 +440,14 @@ pub(crate) fn reencrypt_site(
     target: &mut Site,
     mut to: Option<&mut UserKeys>,
 ) -> Result<()> {
-    let mut convert = |src_ctx: StateCtx<'_>, dst_ctx: StateCtx<'_>, state: &Option<String>| -> Result<Option<String>> {
-        match state {
-            Some(state) if src_ctx.result_type.is_stateful() => {
-                let plain = src_ctx.decrypt(from, state)?;
-                let dst = to.as_deref_mut().unwrap_or(&mut *from);
-                Ok(Some(dst_ctx.encrypt(dst, &plain)?))
-            }
-            _ => Ok(None),
-        }
+    let mut convert = |src_ctx: StateCtx<'_>, dst_ctx: StateCtx<'_>, state: &Option<String>| {
+        reencrypt_state(src_ctx, dst_ctx, state.as_deref(), from, to.as_deref_mut())
     };
 
     target.result_state = convert(source.password_ctx(), target.password_ctx(), &source.result_state)?;
-    target.login_state = match source.login_type {
-        Some(t) => convert(source.login_ctx(t), target.login_ctx(t), &source.login_state)?,
-        None => None,
-    };
+    // A site using the user's login may still hold a stored login of its own.
+    let login_t = source.login_type.unwrap_or(ResultType::DEFAULT_LOGIN);
+    target.login_state = convert(source.login_ctx(login_t), target.login_ctx(login_t), &source.login_state)?;
     for (keyword, q) in &source.questions {
         let state = convert(
             source.answer_ctx(keyword, q.result_type),
@@ -400,4 +461,177 @@ pub(crate) fn reencrypt_site(
         t.state = state;
     }
     Ok(())
+}
+
+// ------------------------------------------------------------ general results
+
+/// What [`User::site_result`] should compute.  Start from [`ResultRequest::password`],
+/// [`ResultRequest::login`] or [`ResultRequest::answer`] and override only what
+/// differs; everything not overridden follows the same defaulting rules as
+/// [`User::site_password`], [`User::site_login`] and [`User::site_answer`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResultRequest<'a> {
+    purpose: KeyPurpose,
+    context: Option<&'a str>,
+    result_type: Option<ResultType>,
+    counter: Option<Counter>,
+    key_bits: Option<u32>,
+}
+
+impl<'a> ResultRequest<'a> {
+    /// A request for `purpose` with no overrides.  For
+    /// [`KeyPurpose::Recovery`] the context is the question keyword.
+    pub fn new(purpose: KeyPurpose) -> Self {
+        Self { purpose, context: None, result_type: None, counter: None, key_bits: None }
+    }
+
+    /// The site password.
+    pub fn password() -> Self {
+        Self::new(KeyPurpose::Authentication)
+    }
+
+    /// The login name.
+    pub fn login() -> Self {
+        Self::new(KeyPurpose::Identification)
+    }
+
+    /// The answer to the question `keyword` (`""`: the site-wide answer).
+    pub fn answer(keyword: &'a str) -> Self {
+        Self::new(KeyPurpose::Recovery).context(keyword)
+    }
+
+    /// The key context mixed into the derivation (the reference's `-C`).  For
+    /// answers it is the question keyword, which also selects the stored
+    /// question.  An empty context is no context.
+    pub fn context(mut self, context: &'a str) -> Self {
+        self.context = Some(context);
+        self
+    }
+
+    /// Use this result type instead of the stored one.  A stateful type
+    /// decrypts the value stored for this purpose.
+    pub fn result_type(mut self, result_type: ResultType) -> Self {
+        self.result_type = Some(result_type);
+        self
+    }
+
+    /// Use this counter instead of the default (the site's counter for
+    /// passwords, 1 for logins and answers).
+    pub fn counter(mut self, counter: Counter) -> Self {
+        self.counter = Some(counter);
+        self
+    }
+
+    /// Derive a binary key ([`ResultType::DeriveKey`]) of `bits` bits
+    /// (128–512, a multiple of 8; `None`: the default size), base64-encoded.
+    pub fn derive_key(mut self, bits: Option<u32>) -> Self {
+        self.result_type = Some(ResultType::DeriveKey);
+        self.key_bits = Some(bits.unwrap_or(0));
+        self
+    }
+
+    pub fn purpose(&self) -> KeyPurpose {
+        self.purpose
+    }
+}
+
+impl User {
+    /// The general form of [`User::site_password`], [`User::site_login`] and
+    /// [`User::site_answer`]: any purpose, with an optional key context, result
+    /// type and counter.  Always computed with the key of the site's algorithm.
+    pub fn site_result(&self, keys: &mut UserKeys, site: &str, request: &ResultRequest<'_>) -> Result<Zeroizing<String>> {
+        self.check_unlocked(keys)?;
+        let s = self.site_ref(site)?;
+        let context = request.context.filter(|c| !c.is_empty());
+        let (ctx, state, what) = match request.purpose {
+            KeyPurpose::Authentication => {
+                let t = request.result_type.unwrap_or(s.result_type);
+                let ctx = StateCtx {
+                    counter: request.counter.unwrap_or(s.counter),
+                    context,
+                    result_type: t,
+                    ..s.password_ctx()
+                };
+                (ctx, s.result_state.as_deref(), "site password")
+            }
+            KeyPurpose::Identification => {
+                // The same choice as `site_login`: the site's own stored login,
+                // else the user's login.
+                let (t, state, user_level) = match s.login_type {
+                    Some(t) if t.is_stateful() && s.login_state.is_some() => (t, s.login_state.as_deref(), false),
+                    Some(t) if !t.is_stateful() => (t, None, false),
+                    _ => (self.login_type, self.login_state.as_deref(), true),
+                };
+                let t = request.result_type.unwrap_or(t);
+                if t.is_stateful() && user_level {
+                    // Stored once for the user, encrypted with the user's key.
+                    let ctx = StateCtx { result_type: t, ..self.login_ctx() };
+                    return ctx.result(keys, state, "login name");
+                }
+                let ctx = StateCtx {
+                    counter: request.counter.unwrap_or(COUNTER_INITIAL),
+                    context,
+                    ..s.login_ctx(t)
+                };
+                (ctx, state, "login name")
+            }
+            KeyPurpose::Recovery => {
+                let keyword = request.context.unwrap_or("");
+                let q = s.questions.get(keyword);
+                let t = request
+                    .result_type
+                    .unwrap_or_else(|| q.map_or(ResultType::DEFAULT_ANSWER, |q| q.result_type));
+                let ctx = StateCtx {
+                    counter: request.counter.unwrap_or(COUNTER_INITIAL),
+                    ..s.answer_ctx(keyword, t)
+                };
+                (ctx, q.and_then(|q| q.state.as_deref()), "answer")
+            }
+        };
+        if ctx.result_type.is_derive() {
+            let bits = request.key_bits.unwrap_or(0).to_string();
+            let key = keys.key(ctx.algorithm)?;
+            return Ok(key.site_result(ctx.name, ctx.counter, ctx.purpose, ctx.context, ctx.result_type, Some(&bits))?);
+        }
+        ctx.result(keys, state, what)
+    }
+
+    /// Move the user to a new master password: every stored value (site
+    /// passwords, site logins, answers and the user's login name) is decrypted
+    /// with `old_keys` and re-encrypted with `new_keys`; the key ID and
+    /// identicon are updated (the identicon is cleared if `new_keys` holds no
+    /// password).  Everything else, including unknown JSON members, is kept.
+    ///
+    /// `old_keys` must have unlocked the user; `new_keys` must be for the same
+    /// full name.  All or nothing: if a value in use cannot be re-encrypted the
+    /// user is unchanged and [`Error::ReencryptFailed`] names the site.  (A
+    /// value kept only for switching back to a stateful type that cannot be
+    /// decrypted is dropped instead.)  On success `new_keys` unlocks the user.
+    pub fn change_master_password(&mut self, old_keys: &mut UserKeys, new_keys: &mut UserKeys) -> Result<()> {
+        self.check_unlocked(old_keys)?;
+        if new_keys.full_name() != self.full_name {
+            return Err(Error::UserMismatch);
+        }
+        let new_id = new_keys.key(self.algorithm)?.key_id();
+        let mut updated = self.clone();
+        for (name, site) in &self.sites {
+            let mut target = site.clone();
+            reencrypt_site(site, old_keys, &mut target, Some(&mut *new_keys))
+                .map_err(|e| Error::ReencryptFailed { site: Some(name.clone()), source: Box::new(e) })?;
+            updated.sites.insert(name.clone(), target);
+        }
+        updated.login_state = reencrypt_state(
+            self.login_ctx(),
+            self.login_ctx(),
+            self.login_state.as_deref(),
+            old_keys,
+            Some(&mut *new_keys),
+        )
+        .map_err(|e| Error::ReencryptFailed { site: None, source: Box::new(e) })?;
+        updated.key_id = Some(new_id.clone());
+        updated.identicon = new_keys.identicon();
+        *self = updated;
+        new_keys.mark_authenticated(new_id);
+        Ok(())
+    }
 }

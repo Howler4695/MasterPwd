@@ -83,6 +83,13 @@ pub enum ExportMode<'k> {
     /// Passwords, logins and answers in clear text.  Needs the authenticated
     /// key holder.  Device-private values are still left out.
     Revealed(&'k mut UserKeys),
+    /// For **this device's own store only** (what [`crate::UserStore`] writes):
+    /// like `Redacted`, plus the encrypted values of device-private
+    /// ([`ResultType::StatefulDevice`]) passwords, logins and answers.  Never use
+    /// it for a file meant to leave the device (exports, backups, sync): the
+    /// whole point of a device-private value is that it is not exported.
+    /// Values are still encrypted; no key is needed.
+    Storage,
 }
 
 /// Internal: what goes into the secret fields.
@@ -229,6 +236,7 @@ pub fn write(user: &User, format: Format, mode: ExportMode<'_>) -> Result<Zeroiz
     let content = match mode {
         ExportMode::Redacted => Content::Export,
         ExportMode::Revealed(keys) => Content::Revealed(keys),
+        ExportMode::Storage => Content::Storage,
     };
     write_with(user, format, content, Timestamp::now())
 }

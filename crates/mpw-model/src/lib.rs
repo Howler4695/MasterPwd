@@ -65,12 +65,12 @@ pub use format::{peek, write, ExportMode, Format, UserFile, UserSummary};
 pub use keys::UserKeys;
 pub use merge::{merge, MergeSummary};
 pub use model::{sort_most_recent_first, Question, Site, User, UserPreferences};
-pub use ops::Authentication;
+pub use ops::{Authentication, ResultRequest};
 pub use store::{decode_name, encode_name, export_to, read_user_file, Listing, StoredUser, UserStore};
 pub use time::Timestamp;
 
 /// Re-exported for convenience: the value types used throughout the API.
-pub use mpw_core::{AlgorithmVersion, Counter, Identicon, KeyId, MasterKey, ResultType, Zeroizing};
+pub use mpw_core::{AlgorithmVersion, Counter, Identicon, KeyId, KeyPurpose, MasterKey, ResultType, Zeroizing};
 
 /// Bounds applied to untrusted input.
 pub mod limits {

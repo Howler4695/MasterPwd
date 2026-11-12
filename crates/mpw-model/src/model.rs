@@ -186,6 +186,11 @@ impl User {
         self.login_state.is_some()
     }
 
+    /// The stored user-level login-name state (ciphertext; see [`Site::password_state`]).
+    pub fn login_state(&self) -> Option<&str> {
+        self.login_state.as_deref()
+    }
+
     /// Forget the key ID, so that the next [`User::authenticate`] adopts the
     /// key it is given ("I changed my master password").  Every generated
     /// password changes with the master password, and stored personal
@@ -329,9 +334,34 @@ impl Site {
         if !template.is_template() {
             return Err(Error::NotStateful(template));
         }
+        // Like the reference, the stored login name is kept (not used while a
+        // template is selected) so that switching back restores it.
         self.login_type = Some(template);
-        self.login_state = None;
         Ok(())
+    }
+
+    /// Switch the login back to a stored value of type `stateful_type` (e.g.
+    /// after [`Site::set_generated_login`]), reusing the login name stored
+    /// earlier.  If none is stored, [`crate::User::site_login`] falls back to
+    /// the user's stored login name.
+    pub fn use_stored_login(&mut self, stateful_type: ResultType) -> Result<()> {
+        if !stateful_type.is_stateful() {
+            return Err(Error::NotStateful(stateful_type));
+        }
+        self.login_type = Some(stateful_type);
+        Ok(())
+    }
+
+    /// The stored password state: **ciphertext** (base64 of the value
+    /// encrypted with the master key), never the password itself.  Present
+    /// even while a template type is selected, if a value was stored before.
+    pub fn password_state(&self) -> Option<&str> {
+        self.result_state.as_deref()
+    }
+
+    /// The stored login-name state (ciphertext; see [`Site::password_state`]).
+    pub fn login_state(&self) -> Option<&str> {
+        self.login_state.as_deref()
     }
 
     /// Whether an (encrypted) password is stored for the site.
@@ -412,6 +442,11 @@ impl Question {
     /// Whether an (encrypted) answer is stored.
     pub fn has_answer_state(&self) -> bool {
         self.state.is_some()
+    }
+
+    /// The stored answer state (ciphertext; see [`Site::password_state`]).
+    pub fn answer_state(&self) -> Option<&str> {
+        self.state.as_deref()
     }
 }
 
