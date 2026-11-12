@@ -9,3 +9,7 @@ repository.workspace = true
 
 [dependencies]
 mpw-core = { path = "../mpw-core" }
+# Unknown JSON members must survive a load/save round trip in their original order.
+serde_json = { version = "1", features = ["preserve_order"] }
+zeroize = "1"
+thiserror = "2"

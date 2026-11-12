@@ -1,0 +1,48 @@
+{
+  "export": {
+    "date": "2019-05-11T11:14:56Z",
+    "redacted": false,
+    "format": 1
+  },
+  "user": {
+    "avatar": 3,
+    "full_name": "Robert Lee Mitchell",
+    "identicon": "2:╚☻╯⛄",
+    "algorithm": 3,
+    "key_id": "98EEF4D1DF46D849574A82A03C3177056B15DFFCA29BB3899DE4628453675302",
+    "default_type": 17,
+    "last_used": "2019-05-11T11:14:56Z"
+  },
+  "sites": {
+    "masterpasswordapp.com": {
+      "counter": 1,
+      "algorithm": 3,
+      "type": 17,
+      "password": "Jejr5[RepuSosp",
+      "login_type": 30,
+      "login_name": "wohzaqage",
+      "uses": 7,
+      "last_used": "2019-05-10T08:00:00Z",
+      "questions": {
+        "question": {
+          "type": 31,
+          "answer": "xogx tem cegyiva jab"
+        },
+        "mother": {
+          "type": 1056,
+          "answer": "Smith"
+        }
+      }
+    },
+    "personal.example": {
+      "counter": 1,
+      "algorithm": 3,
+      "type": 1056,
+      "password": "my personal pw",
+      "login_type": 1056,
+      "login_name": "robert@example.com",
+      "uses": 2,
+      "last_used": "2019-05-09T08:00:00Z"
+    }
+  }
+}

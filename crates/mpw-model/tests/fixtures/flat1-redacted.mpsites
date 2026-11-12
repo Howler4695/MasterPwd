@@ -1,0 +1,21 @@
+# Master Password site export
+#     Export of site names and stored passwords (unless device-private) encrypted with the master key.
+# 
+##
+# Format: 1
+# Date: 2019-05-11T11:14:56Z
+# User Name: Robert Lee Mitchell
+# Full Name: Robert Lee Mitchell
+# Avatar: 3
+# Identicon: 2:╚☻╯⛄
+# Key ID: 98EEF4D1DF46D849574A82A03C3177056B15DFFCA29BB3899DE4628453675302
+# Algorithm: 3
+# Default Type: 17
+# Passwords: PROTECTED
+##
+#
+#               Last     Times  Password                      Login	                     Site	Site
+#               used      used      type                       name	                     name	password
+2019-05-10T08:00:00Z         7    17:3:1                           	    masterpasswordapp.com	
+2019-05-09T08:00:00Z         2  1056:3:1  HcMPU+4PpHX9mGQbbL7wySZmXHVfyEApIZ4x6wGQPu8=	         personal.example	S3thn+F0DS7pzWY1CqfxEw==
+2019-05-08T08:00:00Z         0    20:3:4                           	              pin.example	

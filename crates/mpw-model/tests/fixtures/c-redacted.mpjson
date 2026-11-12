@@ -1,0 +1,80 @@
+{
+  "export": {
+    "date": "2019-05-11T11:14:56Z",
+    "redacted": true,
+    "format": 1
+  },
+  "user": {
+    "avatar": 3,
+    "full_name": "Robert Lee Mitchell",
+    "identicon": "2:╚☻╯⛄",
+    "algorithm": 3,
+    "key_id": "98EEF4D1DF46D849574A82A03C3177056B15DFFCA29BB3899DE4628453675302",
+    "default_type": 17,
+    "last_used": "2019-05-11T11:14:56Z",
+    "_ext_mpw": {
+      "maskPasswords": true,
+      "biometricLock": false,
+      "futurePref": [ 1, { "a": null } ]
+    },
+    "_ext_otherapp": "kept"
+  },
+  "sites": {
+    "masterpasswordapp.com": {
+      "counter": 1,
+      "algorithm": 3,
+      "type": 17,
+      "login_type": 30,
+      "uses": 7,
+      "last_used": "2019-05-10T08:00:00Z",
+      "questions": {
+        "": {
+          "type": 31
+        },
+        "mother": {
+          "type": 1056,
+          "answer": "M/XcwqE2IMc0PJcRob4Gkg=="
+        },
+        "question": {
+          "type": 31
+        }
+      },
+      "_ext_mpw": {
+        "url": "https://masterpasswordapp.com",
+        "_ext_nested": { "x": 1.5 }
+      },
+      "_ext_futureapp": {
+        "color": "blue"
+      }
+    },
+    "old.masterpasswordapp.com": {
+      "counter": 1,
+      "algorithm": 0,
+      "type": 17,
+      "login_type": 30,
+      "uses": 1,
+      "last_used": "2014-08-20T09:00:00Z"
+    },
+    "personal.example": {
+      "counter": 1,
+      "algorithm": 3,
+      "type": 1056,
+      "password": "S3thn+F0DS7pzWY1CqfxEw==",
+      "login_type": 1056,
+      "login_name": "HcMPU+4PpHX9mGQbbL7wySZmXHVfyEApIZ4x6wGQPu8=",
+      "uses": 2,
+      "last_used": "2019-05-09T08:00:00Z"
+    },
+    "device.example": {
+      "counter": 1,
+      "algorithm": 3,
+      "type": 2081,
+      "login_type": 30,
+      "uses": 0,
+      "last_used": "2019-05-08T08:00:00Z"
+    }
+  },
+  "_ext_toplevel": {
+    "keep": "me"
+  }
+}
