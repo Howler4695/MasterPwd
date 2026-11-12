@@ -1,6 +1,8 @@
 //! End-to-end tests of the `mpw` binary against known vectors
 //! (`mpw-core/tests/mpw_tests.xml`).  The master password is always fed via
-//! stdin or a file descriptor, never via arguments.
+//! stdin or a file descriptor, never via arguments.  Every invocation gets a
+//! fresh, empty `HOME`, so these behave as first runs (see `persistence.rs`
+//! for the user-file tests).
 
 use std::io::Write;
 use std::process::{Command, Output, Stdio};
@@ -10,11 +12,26 @@ const NAME: &str = "Robert Lee Mitchell";
 const PASSWORD: &str = "banana colored duckling";
 const SITE: &str = "masterpasswordapp.com";
 
+/// A fresh, empty home directory under cargo's per-target temp dir.
+fn fresh_home() -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static N: AtomicU32 = AtomicU32::new(0);
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "cli-home-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
 fn command() -> Command {
     let mut cmd = Command::new(MPW);
     for var in ["MPW_FULLNAME", "MPW_ALGORITHM", "MPW_FORMAT", "MPW_ASKPASS"] {
         cmd.env_remove(var);
     }
+    cmd.env("HOME", fresh_home());
     cmd
 }
 
@@ -181,6 +198,8 @@ fn password_from_another_fd() {
         .args([MPW, NAME, SITE, PASSWORD])
         .env_remove("MPW_FULLNAME")
         .env_remove("MPW_ALGORITHM")
+        .env_remove("MPW_FORMAT")
+        .env("HOME", fresh_home())
         .output()
         .unwrap();
     assert_result(&o, "Jejr5[RepuSosp");
@@ -203,10 +222,51 @@ fn personal_password_state_and_derived_key() {
     let o = mpw(&["-t", "K", "-P", "256"]);
     assert_result(&o, "TCFYP7cKH8FQ8WYwILAlSfqAcz14K0yPGYV3sBvuyQA=");
 
-    // A personal password without a value or state cannot be produced.
+    // Without -P (and nothing stored) the value is asked for; here stdin has
+    // nothing left after the master password.
     let o = mpw(&["-t", "P"]);
-    assert_eq!(o.status.code(), Some(70));
+    assert_eq!(o.status.code(), Some(65));
+    assert!(
+        stderr(&o).contains("Missing personal password."),
+        "{}",
+        stderr(&o)
+    );
     assert!(o.stdout.is_empty());
+
+    // ... and read from stdin (not a terminal) after the master password.
+    let mut cmd = command();
+    cmd.args(["-u", NAME, "-t", "P", SITE]);
+    let o = run_with_stdin(cmd, &format!("{PASSWORD}\nhunter2\n"));
+    assert_result(&o, "hunter2");
+    let err = stderr(&o);
+    assert!(err.contains("Your personal password: "), "{err}");
+    assert!(
+        err.contains("(state) q7EPkUsq6BtkK0/cX/pqzA== => "),
+        "{err}"
+    );
+    assert!(
+        !err.contains("visible to other users"),
+        "no -P, no warning: {err}"
+    );
+
+    // `-P -` asks for the value, too (no warning).
+    let mut cmd = command();
+    cmd.args(["-u", NAME, "-t", "P", "-P", "-", SITE]);
+    let o = run_with_stdin(cmd, &format!("{PASSWORD}\nhunter2\n"));
+    assert_result(&o, "hunter2");
+    assert!(
+        !stderr(&o).contains("visible to other users"),
+        "{}",
+        stderr(&o)
+    );
+
+    // -P still works, with a warning.
+    let o = mpw(&["-t", "P", "-P", "hunter2"]);
+    assert!(
+        stderr(&o).contains("visible to other users (ps)"),
+        "{}",
+        stderr(&o)
+    );
 }
 
 #[test]
@@ -280,11 +340,4 @@ fn help() {
     assert!(o.status.success());
     assert!(o.stdout.is_empty());
     assert!(stderr(&o).contains("USAGE"));
-}
-
-#[test]
-fn file_options_are_accepted_but_stateless() {
-    let o = mpw(&["-F", "json", "-R", "1"]);
-    assert_result(&o, "Jejr5[RepuSosp");
-    assert!(stderr(&o).contains("not supported by this build yet"));
 }

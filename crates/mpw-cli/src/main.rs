@@ -1,22 +1,22 @@
 //! `mpw`: the Master Password command-line client.
 //!
-//! Option- and environment-compatible with the reference `mpw-cli.c` for the
-//! stateless path.  The result is the only thing written to stdout; prompts,
-//! the identicon and diagnostics go to stderr.  See `args.rs`, `input.rs` and
-//! `store.rs` for the deliberate deviations from the reference.
+//! Option- and environment-compatible with the reference `mpw-cli.c`,
+//! including its user files in `~/.mpw.d`.  The result is the only thing
+//! written to stdout; prompts, the identicon and diagnostics go to stderr.
+//! See `args.rs`, `input.rs`, `store.rs` and `operation.rs` for the
+//! deliberate deviations from the reference.
 
 #![forbid(unsafe_code)]
 
 mod args;
 mod input;
 mod log;
+mod operation;
 mod store;
 
-use log::{dbg_log, inf, wrn, Fatal};
-use mpw_core::{
-    identicon, AlgorithmVersion, Counter, Identicon, KeyPurpose, MasterKey, ResultType,
-    COUNTER_DEFAULT, COUNTER_INITIAL,
-};
+use log::{dbg_log, Fatal};
+use mpw_core::{identicon, AlgorithmVersion, Counter, Identicon, KeyPurpose, ResultType};
+use mpw_model::UserKeys;
 use std::io::{IsTerminal, Write};
 use zeroize::Zeroizing;
 
@@ -25,6 +25,7 @@ pub const EX_OK: i32 = 0;
 pub const EX_USAGE: i32 = 64;
 pub const EX_DATAERR: i32 = 65;
 pub const EX_SOFTWARE: i32 = 70;
+pub const EX_CANTCREAT: i32 = 73;
 pub const EX_IOERR: i32 = 74;
 
 /// The reference re-prompts forever on empty answers; we give up eventually
@@ -86,132 +87,59 @@ fn run() -> Result<(), Fatal> {
     };
     let key_context = args.key_context.clone();
 
-    // SEAM (cli_user/cli_site/cli_question/cli_operation): stored defaults.
-    let stored = store::load(&files, &full_name, &site_name).unwrap_or_default();
-    let (purpose_result, default_type) = match purpose {
-        KeyPurpose::Authentication => ("password", ResultType::DEFAULT),
-        KeyPurpose::Identification => ("login", ResultType::DEFAULT_LOGIN),
-        KeyPurpose::Recovery => ("answer", ResultType::DEFAULT_ANSWER),
+    // Command-line overrides, validated before any expensive work.
+    let result_type = match &args.result_type {
+        None => None,
+        Some(t) => Some(
+            ResultType::from_name(t)
+                .ok_or_else(|| Fatal::new(EX_USAGE, format!("Invalid type: {t}")))?,
+        ),
     };
-    let mut result_type = stored.result_type.unwrap_or(default_type);
-    let mut counter = match purpose {
-        KeyPurpose::Authentication => stored.counter.unwrap_or(COUNTER_DEFAULT),
-        // The reference always uses the initial counter for logins and answers.
-        KeyPurpose::Identification | KeyPurpose::Recovery => COUNTER_INITIAL,
+    let counter = match &args.site_counter {
+        None => None,
+        Some(c) => Some(
+            parse_counter(c)
+                .ok_or_else(|| Fatal::new(EX_USAGE, format!("Invalid site counter: {c}")))?,
+        ),
     };
-    let mut algorithm = stored.algorithm.unwrap_or(AlgorithmVersion::CURRENT);
-    let mut result_state = stored.state;
+    let algorithm = match &args.algorithm_version {
+        None => None,
+        Some(a) => Some(
+            a.trim()
+                .parse::<u32>()
+                .ok()
+                .and_then(AlgorithmVersion::from_u32)
+                .ok_or_else(|| Fatal::new(EX_USAGE, format!("Invalid algorithm version: {a}")))?,
+        ),
+    };
 
-    // Command-line overrides.
-    if let Some(t) = &args.result_type {
-        result_type = ResultType::from_name(t)
-            .ok_or_else(|| Fatal::new(EX_USAGE, format!("Invalid type: {t}")))?;
-    }
-    if let Some(c) = &args.site_counter {
-        let value = parse_counter(c)
-            .ok_or_else(|| Fatal::new(EX_USAGE, format!("Invalid site counter: {c}")))?;
-        match purpose {
-            KeyPurpose::Authentication => counter = value,
-            _ => wrn!(
-                "The counter is ignored for {} (like the reference, it is always 1).",
-                purpose
-            ),
-        }
-    }
-    if let Some(a) = &args.algorithm_version {
-        algorithm = a
-            .trim()
-            .parse::<u32>()
-            .ok()
-            .and_then(AlgorithmVersion::from_u32)
-            .ok_or_else(|| Fatal::new(EX_USAGE, format!("Invalid algorithm version: {a}")))?;
-    }
-    let mut result_param = args.result_param.take().map(Zeroizing::new);
-
-    dbg_log!("-----------------");
-    dbg_log!("fullName         : {full_name}");
-    dbg_log!("siteName         : {site_name}");
-    dbg_log!("siteCounter      : {counter}");
-    dbg_log!(
-        "resultType       : {} ({})",
-        result_type.short_name(),
-        result_type.as_u32()
-    );
-    dbg_log!(
-        "resultParam      : {}",
-        if result_param.is_some() {
-            "(given)"
-        } else {
-            "(none)"
-        }
-    );
-    dbg_log!("keyPurpose       : {} ({})", purpose, purpose as u8);
-    dbg_log!(
-        "keyContext       : {}",
-        key_context.as_deref().unwrap_or("(none)")
-    );
-    dbg_log!("algorithmVersion : {}", algorithm.as_u32());
-    dbg_log!(
-        "sitesFormat      : {:?}{}",
-        files.format,
-        if files.format_fixed { " (fixed)" } else { "" }
-    );
-    dbg_log!("-----------------");
-
-    // cli_mpw
     let identicon = identicon(&full_name, &master_password);
-    if log::enabled(log::LEVEL_INFO) {
-        eprint!(
-            "{full_name}'s {purpose_result} for {site_name}:\n[ {} ]: ",
-            render_identicon(&identicon)
-        );
-        let _ = std::io::stderr().flush();
-    }
-
-    // SEAM: with a user file, derive the key for the *user's* algorithm first
-    // and compare its key ID with the stored one (constant time) before going on.
-    let master_key = MasterKey::derive(&full_name, &master_password, algorithm)
-        .map_err(|e| Fatal::new(EX_SOFTWARE, format!("Couldn't derive master key: {e}")))?;
+    let mut keys = UserKeys::from_password(&full_name, &master_password);
     drop(master_password);
 
-    // Stateful types: -P is the value to encrypt; the state then feeds the result.
-    let mut new_state = None;
-    if let Some(param) = result_param.as_ref().filter(|_| result_type.is_stateful()) {
-        let state = master_key
-            .site_state(
-                &site_name,
-                counter,
-                purpose,
-                key_context.as_deref(),
-                result_type,
-                param,
-            )
-            .map_err(|e| Fatal::new(EX_SOFTWARE, format!("Couldn't encrypt site result: {e}")))?;
-        inf!("(state) {state} => ");
-        result_state = Some(state.clone());
-        new_state = Some(state);
-        result_param = None;
-    }
-    if result_param.is_none() {
-        result_param = result_state.map(Zeroizing::new);
-    }
-
-    let result = master_key
-        .site_result(
-            &site_name,
-            counter,
-            purpose,
-            key_context.as_deref(),
-            result_type,
-            result_param.as_ref().map(|p| p.as_str()),
-        )
-        .map_err(|e| Fatal::new(EX_SOFTWARE, format!("Couldn't generate site result: {e}")))?;
-    drop(master_key);
-    write_result(&result)?;
-
-    // SEAM (cli_save).
-    store::save(&files, &full_name, &site_name, new_state.as_deref());
-    Ok(())
+    let request = operation::Request {
+        full_name: full_name.clone(),
+        site_name: site_name.clone(),
+        purpose,
+        key_context,
+        result_type,
+        counter,
+        algorithm,
+        result_param: args.result_param.take().map(Zeroizing::new),
+        allow_password_update: args.allow_password_update,
+        files,
+    };
+    operation::run(request, &mut keys, |outcome| {
+        if log::enabled(log::LEVEL_INFO) {
+            eprint!(
+                "{full_name}'s {} for {site_name}:\n[ {} ]: ",
+                outcome.purpose_result,
+                render_identicon(&identicon)
+            );
+            let _ = std::io::stderr().flush();
+        }
+        write_result(&outcome.result)
+    })
 }
 
 fn full_name(args: &args::Arguments) -> Result<String, Fatal> {
@@ -314,7 +242,8 @@ USAGE
 
   -u full-name Specify the full name of the user.
                -u checks the master password against the config,
-               -U allows updating to a new master password.
+               -U allows updating to a new master password (the old one is
+               asked for, stored values are re-encrypted).
                Defaults to {ENV_FULL_NAME} in env or prompts.
 
   -m fd        Read the master password of the user from a file descriptor.
@@ -336,12 +265,17 @@ USAGE
                    n, name     | 9 letter name.
                    p, phrase   | 20 character sentence.
                    K, key      | encryption key (512 bit or -P bits).
-                   P, personal | saved personal password (save with -P pw).
+                   P, personal | saved personal password (asked for, see -P).
 
   -P value     The parameter value.
                    -p i        | The login name for the site.
                    -t K        | The bit size of the key to generate (eg. 256).
                    -t P        | The personal password to encrypt.
+               For -t P (and personal login names / answers), prefer omitting
+               -P: the value is then asked for with echo off (twice), or read
+               as one line from stdin when stdin is not a terminal.  A value
+               given with -P is visible to other users (ps) and in shell
+               history.  -P - also asks for it (to change a stored value).
 
   -c counter   The value of the counter.
                Defaults to 1.  0 means a time-based (TOTP) counter.
@@ -362,13 +296,20 @@ USAGE
                    -p r        | Most significant word in security question.
 
   -f|F format  The file format to use for reading/writing user state.
-               (Not supported by this build yet: it works statelessly.)
+               -f reads the given format, allows fall-back & writes the default format (json).
+               -F reads & writes only the given format.
+               Defaults to env var {ENV_FORMAT} or the default format (json).
                    n, none     | No file
                    f, flat     | ~/.mpw.d/Full Name.mpsites
                    j, json     | ~/.mpw.d/Full Name.mpjson
+               Files are written atomically, mode 0600, in a 0700 directory.
+               '/' and a leading '.' in the name become '_'.
 
-  -R redacted  Whether to save the mpsites in redacted format or not.
-               (Not supported by this build yet.)
+  -R redacted  Whether to save the user file in redacted format or not.
+               Redaction omits or encrypts any secrets, making the file safe
+               for saving on or transmitting via untrusted media.
+               Defaults to 1, redacted: a clear-text file is only written
+               when -R 0 is given explicitly.
 
   -v           Increase output verbosity (can be repeated).
   -q           Decrease output verbosity (can be repeated).

@@ -130,6 +130,34 @@ pub fn getpass(prompt: &str) -> Result<Option<Zeroizing<String>>, Fatal> {
     }
 }
 
+/// Prompt for a value to store for a stateful result type (a personal
+/// password, login name or answer), so it never has to go on the command line.
+///
+/// On a terminal: echo off, asked twice, must match.  Otherwise: one line from
+/// stdin.  Empty input or EOF is an error.
+pub fn get_secret_value(what: &str) -> Result<Zeroizing<String>, Fatal> {
+    let missing = || Fatal::new(EX_DATAERR, format!("Missing {what}."));
+    if !std::io::stdin().is_terminal() {
+        return getpass(&format!("Your {what}: "))?
+            .filter(|v| !v.is_empty())
+            .ok_or_else(missing);
+    }
+    for _ in 0..3 {
+        let Some(first) = getpass(&format!("Your {what}: "))?.filter(|v| !v.is_empty()) else {
+            return Err(missing());
+        };
+        let second = getpass(&format!("Your {what} (again): "))?.ok_or_else(missing)?;
+        if *first == *second {
+            return Ok(first);
+        }
+        eprintln!("The two entries do not match; try again.");
+    }
+    Err(Fatal::new(
+        EX_DATAERR,
+        format!("The {what} entries did not match."),
+    ))
+}
+
 /// Read the master password from file descriptor `fd` (the `-m` option).
 ///
 /// Compatibility: the whole content is used verbatim, including any trailing

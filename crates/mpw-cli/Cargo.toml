@@ -13,6 +13,6 @@ path = "src/main.rs"
 
 [dependencies]
 mpw-core = { path = "../mpw-core" }
-# mpw-model is wired in a later round (user files: -f/-F/-R, ~/.mpw.d); see src/store.rs.
+mpw-model = { path = "../mpw-model" }
 rpassword = "7"
 zeroize = "1"

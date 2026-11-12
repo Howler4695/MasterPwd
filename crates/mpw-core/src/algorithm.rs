@@ -349,8 +349,8 @@ fn derived_key(
         bits = DERIVE_KEY_BITS_DEFAULT;
     }
     if !(DERIVE_KEY_BITS_MIN..=DERIVE_KEY_BITS_MAX).contains(&bits) || bits % 8 != 0 {
-        return Err(Error::KeyDerivation(
-            "the result parameter is not a valid key size (128-512 bits, a multiple of 8)".into(),
+        return Err(Error::InvalidResultParam(
+            "the key size must be 128-512 bits, a multiple of 8",
         ));
     }
     let size = usize::try_from(bits / 8).map_err(|_| Error::Internal("key size".into()))?;

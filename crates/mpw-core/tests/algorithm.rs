@@ -168,7 +168,7 @@ fn derive_key_matches_independent_blake2b() {
     );
     for bad in ["64", "520", "129", "-128", "99999999999999999999"] {
         assert!(
-            matches!(result(&k, t, Some(bad)), Err(Error::KeyDerivation(_))),
+            matches!(result(&k, t, Some(bad)), Err(Error::InvalidResultParam(_))),
             "{bad}"
         );
     }
