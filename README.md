@@ -29,10 +29,44 @@ A menu-bar app (no Dock icon).
   login name, security-question answers.
 - Import and export `.mpsites` / `.mpjson` files, with merge.
 - Change your master password; stored passwords are re-encrypted.
+- Optional second factor: require your smart card (CAC / PIV) as well as
+  your master password — see below.
 - Optional *Save Password*: keeps your derived keys in the Keychain and
   unlocks with Touch ID or your Mac password.
 - A copied password is cleared from the clipboard after 60 seconds.
 - Locks on sleep, screen lock, fast user switch and after 15 idle minutes.
+
+### Smart card (CAC / PIV) second factor
+
+*Second Factor ▸ Require Smart Card…* makes unlocking need your master
+password **and** your card.
+
+Master Password is stateless: anyone who knows your name and master password
+can compute your passwords with any implementation, so a card check inside
+the app alone would protect nothing. Instead, enabling the second factor
+generates a random 160-bit secret and makes your effective master password
+`<your master password> <recovery code>`, where the recovery code is that
+secret in printable form. The secret is stored in your user file encrypted to
+your card's encryption certificate (PIV slot 9D), so day to day you type your
+master password, insert the card and enter its PIN in the macOS prompt.
+
+- The secret is random. It is not derived from the card or from anything on
+  it, and the app never sees the PIN.
+- **Enabling it changes every generated password**, like changing your master
+  password. Stored personal passwords are re-encrypted.
+- Write the recovery code down. If the card is lost, expires or is reissued,
+  unlock with the code and enrol the new card. The code also works in any
+  other Master Password app and in `mpw`: type your master password, a space
+  and the code.
+- Only a fingerprint of the certificate and a generic label are stored — not
+  the certificate, your name or your ID number.
+- *Save Password* is unavailable while the second factor is on, since saved
+  keys would bypass the card.
+- Run `"dist/Master Password.app/Contents/MacOS/MasterPwd" --smart-cards` to
+  see what the app finds on an inserted card.
+
+This has been tested against software keys only; see the limitations in
+`docs/CHANGES-FROM-ORIGINAL.md`.
 
 Build the app bundle:
 
@@ -57,6 +91,10 @@ Requires macOS 11 or later; *Open at Login* needs macOS 13.
 
 The master password is prompted for with echo off, or read from stdin or a
 file descriptor (`-m`). It is never accepted as a command-line argument.
+
+For a user with the second factor enabled, `mpw` is the recovery path: it
+asks for the recovery code (or reads it from `-k fd`). It does not talk to
+the card.
 
 The app and the CLI keep separate user files (the app's are inside its
 sandbox container). Use import and export to move a user between them.

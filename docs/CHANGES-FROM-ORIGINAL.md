@@ -99,7 +99,37 @@ password is wiped as soon as the keys exist.
 | Bundles Font Awesome Pro fonts. | Not carried over (paid licence); system fonts and SF Symbols are used. |
 | Intel-only binary. | Native arm64 (universal when an x86_64 Rust target is installed). |
 
+## New: smart card second factor
+
+The original has no second factor. The rewrite adds an opt-in one, enforced
+by the key derivation rather than by an app-level check (see the README for
+how it works). Design decisions:
+
+- **Not OIDC.** An OIDC login proves identity to a server; this app has none.
+  A token could only gate the app, which anyone with the master password
+  could bypass with another implementation. Making it real would need a
+  key-escrow service and network access. The card is used directly instead.
+- **Encrypt to the card, never derive from it.** The secret is random and is
+  wrapped to the card's key-management certificate with RSA-OAEP-SHA256 or
+  ECIES. Signature keys are never used to derive secrets, and PKCS#1 v1.5
+  encryption is never used. A reissued card only needs re-enrolment.
+- **PIN safety.** The PIN is entered in the macOS prompt and never reaches
+  the app. One user action causes at most one decryption attempt; nothing is
+  retried automatically, because a CAC locks after three wrong PINs.
+- **Privacy.** A CAC certificate names its holder and carries their ID
+  number, so only a fingerprint and a generic label are stored.
+- **No lock-in.** Recovery is the master password, a space and the recovery
+  code, typed into any Master Password implementation.
+
 ## Known limitations of the rewrite
+
+- **The smart card path is untested with a real card.** Encryption and
+  decryption are tested against software keys through the same code. Reading
+  a real card's certificates, the PIN prompt and on-card decryption are
+  unverified, including whether a sandboxed, ad-hoc signed build can read a
+  card's keychain items at all. `--smart-cards` reports what the app sees.
+- Passkeys are not supported: Apple's API needs a Developer ID signature and
+  an associated domain. The slot format leaves room for other authenticators.
 
 - Memory wiping is best effort: copies inside the scrypt, HMAC and JSON
   libraries, and stack copies made when a key is moved, are outside our
