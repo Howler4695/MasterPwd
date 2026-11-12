@@ -7,6 +7,7 @@
 pub mod app;
 pub mod avatars;
 pub mod cgwindow;
+pub mod debug_state;
 pub mod dialogs;
 pub mod defaults;
 pub mod hotkey;
@@ -15,6 +16,7 @@ pub mod local_auth;
 pub mod login_item;
 pub mod pasteboard;
 pub mod runloop;
+pub mod secure_input;
 pub mod sites_window;
 pub mod smoke;
 pub mod status_item;

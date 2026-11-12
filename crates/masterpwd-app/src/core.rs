@@ -136,6 +136,7 @@ enum Pending {
     ImportPassword,
     ExportWarning,
     ExportPassword,
+    ChangePassword,
 }
 
 enum FilePending {
@@ -146,6 +147,8 @@ enum FilePending {
 const STEP_EXISTING: u32 = 1;
 const STEP_IMPORT: u32 = 2;
 const STEP_EXPORT: u32 = 3;
+const STEP_CHANGE_CURRENT: u32 = 4;
+const STEP_CHANGE_NEW: u32 = 5;
 
 pub struct AppCore {
     vm: SitesViewModel,
@@ -166,6 +169,15 @@ pub struct AppCore {
     export: Option<ExportFlow>,
     device_auth: Option<(u64, String)>,
     last_save_error: Option<String>,
+    change_password: Option<ChangeFlow>,
+    last_close_reason: Option<String>,
+}
+
+/// Change Master Password: both derivations run off the main thread.
+struct ChangeFlow {
+    id: u64,
+    current: Option<(UserKeys, mpw_core::Identicon)>,
+    new: Option<(UserKeys, mpw_core::Identicon)>,
 }
 
 fn plural(n: u32, unit: &str) -> String {
@@ -229,6 +241,8 @@ impl AppCore {
             export: None,
             device_auth: None,
             last_save_error: None,
+            change_password: None,
+            last_close_reason: None,
         }
     }
 
@@ -304,9 +318,15 @@ impl AppCore {
                 VmEffect::ScheduleIdenticon { generation, delay } => {
                     out.push(UiEffect::ScheduleIdenticon { generation, delay })
                 }
-                VmEffect::CloseWindow => out.push(UiEffect::CloseSitesWindow),
+                VmEffect::CloseWindow => {
+                    self.last_close_reason = Some("Esc / cancel".into());
+                    out.push(UiEffect::CloseSitesWindow)
+                }
                 VmEffect::Copy { text } => match self.clipboard.copy(self.pasteboard.as_mut(), &text, now) {
-                    Ok(()) => out.extend([UiEffect::CloseSitesWindow, UiEffect::HideApp]),
+                    Ok(()) => {
+                        self.last_close_reason = Some("copied".into());
+                        out.extend([UiEffect::CloseSitesWindow, UiEffect::HideApp])
+                    }
                     Err(e) => self.vm.set_error(format!("Could not copy: {e}")),
                 },
                 VmEffect::Ask(ask) => {
@@ -347,6 +367,7 @@ impl AppCore {
         self.import = None;
         self.export = None;
         self.device_auth = None;
+        self.change_password = None;
         self.prompts.clear();
         self.files.clear();
         if reason.clears_clipboard() {
@@ -372,14 +393,31 @@ impl AppCore {
         self.window_open
     }
 
-    /// The app lost focus: dismiss the sites window, as the original did —
-    /// unless one of our dialogs or panels is up.
+    /// Keyboard focus left us for another app (the app resigned active, or
+    /// the non-activating sites panel lost key status to another app):
+    /// dismiss the sites window, as the original did — unless one of our
+    /// dialogs, panels or the Touch ID prompt is up.
     pub fn app_did_resign_active(&mut self) -> Vec<UiEffect> {
         if self.window_open && self.prompts.is_empty() && self.files.is_empty() && self.device_auth.is_none() {
+            self.last_close_reason = Some("keyboard focus moved to another app".into());
             vec![UiEffect::CloseSitesWindow]
         } else {
             Vec::new()
         }
+    }
+
+    /// Whether a dialog, file panel or Touch ID prompt of ours is pending.
+    pub fn is_busy(&self) -> bool {
+        !self.prompts.is_empty() || !self.files.is_empty() || self.device_auth.is_some()
+    }
+
+    /// Why the sites window last closed (debug state).
+    pub fn last_close_reason(&self) -> Option<&str> {
+        self.last_close_reason.as_deref()
+    }
+
+    pub fn set_close_reason(&mut self, reason: impl Into<String>) {
+        self.last_close_reason = Some(reason.into());
     }
 
     pub fn system_event(&mut self, event: SystemEvent) -> Vec<UiEffect> {
@@ -389,7 +427,12 @@ impl AppCore {
             SystemEvent::SessionResignedActive => LockReason::SessionSwitched,
         };
         self.lock(reason);
-        if self.window_open { vec![UiEffect::CloseSitesWindow] } else { Vec::new() }
+        if self.window_open {
+            self.last_close_reason = Some(format!("system event: {event:?}"));
+            vec![UiEffect::CloseSitesWindow]
+        } else {
+            Vec::new()
+        }
     }
 
     /// About once a second: clipboard timeout, idle lock, debounced saves and
@@ -510,6 +553,7 @@ impl AppCore {
                 .button("Cancel", ButtonRole::Cancel);
                 vec![self.ask(prompt, Pending::ExportPassword)]
             }
+            Pending::ChangePassword => self.change_password_answered(answer),
             Pending::ExportPassword => {
                 let (Some(flow), Some(name)) = (&self.export, self.vm.unlocked_user()) else { return Vec::new() };
                 if answer.button != 0 || answer.value(0).is_empty() {
@@ -678,6 +722,9 @@ impl AppCore {
     }
 
     fn flow_derived(&mut self, flow_id: u64, step: u32, derived: Derived) -> Vec<UiEffect> {
+        if step == STEP_CHANGE_CURRENT || step == STEP_CHANGE_NEW {
+            return self.change_password_derived(flow_id, step, derived);
+        }
         let keys = match derived.result {
             Ok((keys, _)) => keys,
             Err(e) => {
@@ -866,6 +913,109 @@ impl AppCore {
         }
     }
 
+    // ------------------------------------------------ change master password
+
+    fn ask_change_password(&mut self) -> Vec<UiEffect> {
+        let Some(name) = self.vm.unlocked_user().map(str::to_owned) else { return Vec::new() };
+        let prompt = Prompt::new(
+            Style::Critical,
+            format!("Change {name}'s master password?"),
+            format!(
+                "EVERY generated password, login name and answer of {name} changes with the master password: \
+                 you will have to change your password on every site.  Only do this if your master password \
+                 was compromised.\n\nStored (personal) passwords are re-encrypted and kept.  Any key saved in \
+                 the Keychain is removed.  All or nothing: if anything cannot be converted, nothing changes."
+            ),
+        )
+        .field("Current master password", true)
+        .field("New master password", true)
+        .field("New master password again", true)
+        .button("Cancel", ButtonRole::Cancel)
+        .button("Change Master Password", ButtonRole::Destructive);
+        vec![self.ask(prompt, Pending::ChangePassword)]
+    }
+
+    fn change_password_answered(&mut self, answer: PromptAnswer) -> Vec<UiEffect> {
+        if answer.button != 1 {
+            return Vec::new();
+        }
+        let Some(name) = self.vm.unlocked_user().map(str::to_owned) else { return Vec::new() };
+        let (current, new, again) = (answer.value(0), answer.value(1), answer.value(2));
+        let problem = if current.is_empty() || new.is_empty() {
+            Some("Enter your current and your new master password.")
+        } else if new != again {
+            Some("The two new master passwords differ.")
+        } else if new == current {
+            Some("The new master password is the same as the current one.")
+        } else {
+            None
+        };
+        if let Some(problem) = problem {
+            return vec![self.error_prompt("Master password not changed", problem)];
+        }
+        let flow = self.id();
+        self.change_password = Some(ChangeFlow { id: flow, current: None, new: None });
+        let (a, b) = (self.id(), self.id());
+        vec![
+            UiEffect::Derive(DeriveJob::new(
+                a,
+                DerivePurpose::Flow { flow, step: STEP_CHANGE_CURRENT },
+                &name,
+                Zeroizing::new(current.to_owned()),
+            )),
+            UiEffect::Derive(DeriveJob::new(
+                b,
+                DerivePurpose::Flow { flow, step: STEP_CHANGE_NEW },
+                &name,
+                Zeroizing::new(new.to_owned()),
+            )),
+        ]
+    }
+
+    fn change_password_derived(&mut self, flow_id: u64, step: u32, derived: Derived) -> Vec<UiEffect> {
+        let Some(flow) = self.change_password.as_mut().filter(|f| f.id == flow_id) else { return Vec::new() };
+        let keys = match derived.result {
+            Ok(k) => k,
+            Err(e) => {
+                self.change_password = None;
+                return vec![self.error_prompt("Master password not changed", capitalise(&e))];
+            }
+        };
+        if step == STEP_CHANGE_CURRENT {
+            flow.current = Some(keys);
+        } else {
+            flow.new = Some(keys);
+        }
+        if flow.current.is_none() || flow.new.is_none() {
+            return Vec::new();
+        }
+        let flow = self.change_password.take().expect("checked above");
+        let ((mut old, _), (mut new, new_icon)) = (flow.current.expect("set"), flow.new.expect("set"));
+        let Some((user, _)) = self.vm.session_mut() else { return Vec::new() };
+        let name = user.full_name().to_owned();
+        // Check the current password against the key ID first.
+        if let Err(e) = user.authenticate(&mut old) {
+            let e = StoreError::from_model(e, &name);
+            return vec![self.error_prompt("Master password not changed", e.to_string())];
+        }
+        if let Err(e) = user.change_master_password(&mut old, &mut new) {
+            return vec![self.error_prompt("Master password not changed", capitalise(&e.to_string()))];
+        }
+        user.identicon = Some(new_icon);
+        user.preferences.biometric_lock = false;
+        let _ = self.vault.delete_all(&name);
+        self.vm.replace_session_keys(new);
+        self.vm.mark_dirty();
+        self.vm.persist_now();
+        self.vm.saver().flush();
+        self.vm.refresh_users();
+        vec![self.info(
+            format!("{name}'s master password was changed"),
+            "Every generated password is different now: update your password on each site (copy the new one \
+             from here).  Saved Keychain keys were removed; turn Save Password on again if you want it.",
+        )]
+    }
+
     // ------------------------------------------------------- saved keys
 
     /// "Unlock with Touch ID" for the picked user.
@@ -982,6 +1132,7 @@ impl AppCore {
                 LoginItemState::Enabled | LoginItemState::RequiresApproval => vec![UiEffect::SetLoginItem(false)],
             },
             MenuCommand::ShowWelcome => vec![UiEffect::ShowWelcome],
+            MenuCommand::ChangeMasterPassword => self.ask_change_password(),
             MenuCommand::ToggleSavePassword => self.toggle_save_password(),
             MenuCommand::SelectUser(i) => {
                 let name = self.vm.users().get(i as usize).map(|u| u.full_name.clone());
@@ -1179,6 +1330,13 @@ impl AppCore {
             MenuEntry::Separator,
             users.into(),
             MenuItem::new("New User…", MenuCommand::NewUser).into(),
+            match unlocked {
+                Some(_) => MenuItem::new("Change Master Password…", MenuCommand::ChangeMasterPassword),
+                None => MenuItem::new("Change Master Password…", MenuCommand::ChangeMasterPassword)
+                    .enabled(false)
+                    .tooltip("Unlock the user first."),
+            }
+            .into(),
             delete.into(),
             MenuEntry::Separator,
             preferences.into(),
@@ -1619,6 +1777,58 @@ mod tests {
         assert!(!r.core.vm().is_unlocked());
         assert!(r.core.vm().error().unwrap().contains("Incorrect master password"));
         let _ = run(Vec::new());
+    }
+
+    #[test]
+    fn change_master_password() {
+        let mut r = rig(remember());
+        create(&mut r, NAME, PASSWORD);
+        copy_site(&mut r);
+        r.core.vm_event(r.now, |vm| {
+            vm.set_site_query("own.com");
+            vm.choose_type(crate::view_model::TypeChoice::Password(mpw_core::ResultType::StatefulPersonal))
+        });
+        let p = take_prompt(r.core.vm_event(r.now, |vm| {
+            vm.set_site_query("own.com");
+            vm.choose_type(crate::view_model::TypeChoice::Password(mpw_core::ResultType::StatefulPersonal))
+        }));
+        answer(&mut r, &p, "Save", &["kept-secret"]);
+        r.core.command(MenuCommand::ToggleSavePassword, r.now);
+
+        let p = take_prompt(r.core.command(MenuCommand::ChangeMasterPassword, r.now));
+        assert_eq!(p.buttons[0].role, ButtonRole::Cancel);
+        assert!(p.message.contains("EVERY generated password"));
+        let refused = take_prompt(answer(&mut r, &p, "Change Master Password", &[PASSWORD, "a", "b"]));
+        assert!(refused.message.contains("differ"));
+        let p = take_prompt(r.core.command(MenuCommand::ChangeMasterPassword, r.now));
+        let wrong = take_prompt(answer(&mut r, &p, "Change Master Password", &["wrong", "new pw", "new pw"]));
+        assert!(wrong.message.contains("Incorrect master password"), "{}", wrong.message);
+        let p = take_prompt(r.core.command(MenuCommand::ChangeMasterPassword, r.now));
+        let done = take_prompt(answer(&mut r, &p, "Change Master Password", &[PASSWORD, "new pw", "new pw"]));
+        assert!(done.title.contains("was changed"), "{done:?}");
+        assert!(r.core.vm().is_unlocked());
+        assert_ne!(r.core.vm().result(), Some(SITE_PASSWORD));
+        assert!(r.core.vault.load_all(NAME).unwrap().is_none(), "saved keys purged");
+
+        r.core.command(MenuCommand::Lock, r.now);
+        unlock(&mut r, NAME, PASSWORD);
+        assert!(!r.core.vm().is_unlocked(), "the old password no longer works");
+        unlock(&mut r, NAME, "new pw");
+        assert!(r.core.vm().is_unlocked());
+        r.core.vm_event(r.now, |vm| {
+            vm.set_site_query("own.com");
+            Vec::new()
+        });
+        assert_eq!(r.core.vm().result(), Some("kept-secret"), "stored password re-encrypted");
+    }
+
+    #[test]
+    fn close_reasons_are_recorded() {
+        let mut r = rig(MemoryPrefs::default());
+        create(&mut r, NAME, PASSWORD);
+        r.core.window_did_show(r.now);
+        r.core.app_did_resign_active();
+        assert_eq!(r.core.last_close_reason(), Some("keyboard focus moved to another app"));
     }
 
     #[test]

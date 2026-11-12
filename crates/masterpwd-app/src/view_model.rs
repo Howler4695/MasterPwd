@@ -223,6 +223,7 @@ pub struct SitesView {
 }
 
 const HINT_PICK: &str = "⏎ unlock · esc close";
+const HINT_NEW: &str = "⏎ next field, then create the user · esc close";
 const HINT_UNLOCKED: &str = "⏎ copy password · ⇧⏎ copy login · ↑↓ choose · ⌥ reveal · esc close";
 
 pub fn template_types() -> Vec<ResultType> {
@@ -649,6 +650,17 @@ impl SitesViewModel {
     pub fn mark_dirty(&mut self) {
         if let Some(s) = &mut self.session {
             s.dirty_since.get_or_insert_with(Instant::now);
+        }
+    }
+
+    /// Swap in new keys for the session (after a master-password change; the
+    /// keys must already unlock the session's user).
+    pub fn replace_session_keys(&mut self, keys: UserKeys) {
+        if let Some(s) = &mut self.session {
+            if s.user.is_unlocked_by(&keys) {
+                s.keys = keys;
+                self.recompute();
+            }
         }
     }
 
@@ -1147,6 +1159,9 @@ impl SitesViewModel {
         let prompt = match (self.screen, &self.session) {
             (_, Some(s)) => format!("{}'s {what} for:", s.user.full_name()),
             (Screen::Unlocking, _) => "Unlocking…".to_owned(),
+            (Screen::NewUser, _) if self.users.is_empty() => {
+                "Welcome! Create your user: your full name and a master password".to_owned()
+            }
             (Screen::NewUser, _) => "New user: your full name and a master password".to_owned(),
             _ => match &self.picked {
                 Some(name) => format!("Enter {name}'s master password:"),
@@ -1215,7 +1230,11 @@ impl SitesViewModel {
             can_copy: self.result.is_some(),
             error: self.error.clone(),
             notice: self.notice.clone(),
-            hint: if self.screen == Screen::Unlocked { HINT_UNLOCKED } else { HINT_PICK },
+            hint: match self.screen {
+                Screen::Unlocked => HINT_UNLOCKED,
+                Screen::NewUser => HINT_NEW,
+                _ => HINT_PICK,
+            },
         }
     }
 }

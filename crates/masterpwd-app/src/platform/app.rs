@@ -71,6 +71,8 @@ thread_local! {
     static AUTH: RefCell<Option<Box<dyn DeviceAuthenticator>>> = const { RefCell::new(None) };
     /// Files opened (Finder) before launch finished.
     static PENDING_OPEN: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+    /// Our status menu is open (it takes the keyboard from the panel).
+    static MENU_OPEN: Cell<bool> = const { Cell::new(false) };
 }
 
 pub const SMOKE_DEFAULTS_SUITE: &str = "com.github.howler4695.masterpwd.smoke-test";
@@ -119,6 +121,83 @@ pub(super) fn render() {
         ui.status.set_locked(screen != Screen::Unlocked);
         ui.welcome.render(&login);
     });
+    update_focus_state();
+}
+
+/// Secure Event Input and the debug state file follow the keyboard focus.
+pub(super) fn update_focus_state() {
+    let Some(mtm) = MainThreadMarker::new() else { return };
+    let Some((visible, key, sheet_key, first_responder)) = with_ui(|ui| {
+        let sheet_key = ui.sites.sheet().is_some_and(|s| s.isKeyWindow());
+        (ui.sites.is_visible(), ui.sites.is_key(), sheet_key, ui.sites.first_responder_class())
+    }) else {
+        return;
+    };
+    let core_state = with_core(|c| {
+        let v = c.vm().view();
+        (
+            c.vm().screen(),
+            v.picked_name.clone(),
+            v.users.len(),
+            v.selection.and_then(|i| v.candidates.get(i)).map(|c| c.name.clone()).unwrap_or_default(),
+            v.result_display.chars().count(),
+            v.result_masked,
+            v.error.clone().unwrap_or_default(),
+            c.last_close_reason().unwrap_or("").to_owned(),
+            c.is_busy(),
+        )
+    });
+    let Some((screen, picked, users, site, result_len, masked, error, close_reason, busy)) = core_state else {
+        return;
+    };
+    let password_screen = matches!(screen, Screen::Pick | Screen::NewUser | Screen::Unlocking);
+    super::secure_input::set(visible && ((key && password_screen) || sheet_key));
+    if !super::debug_state::enabled() {
+        return;
+    }
+    let app = NSApplication::sharedApplication(mtm);
+    let app_key = app.keyWindow().map(|w| w.title().to_string()).unwrap_or_else(|| "none".into());
+    let frontmost = objc2_app_kit::NSWorkspace::sharedWorkspace()
+        .frontmostApplication()
+        .and_then(|a| a.localizedName())
+        .map(|n| n.to_string())
+        .unwrap_or_default();
+    super::debug_state::write(&[
+        ("window_visible", visible.to_string()),
+        ("window_is_key", key.to_string()),
+        ("sheet_is_key", sheet_key.to_string()),
+        ("app_key_window", app_key),
+        ("first_responder", first_responder),
+        ("app_active", app.isActive().to_string()),
+        ("frontmost_app", frontmost),
+        ("secure_input_ours", super::secure_input::ours().to_string()),
+        ("secure_input_system", super::secure_input::system().to_string()),
+        ("screen", format!("{screen:?}")),
+        ("picked_user", picked),
+        ("users", users.to_string()),
+        ("selected_site", site),
+        ("result_len", result_len.to_string()),
+        ("result_masked", masked.to_string()),
+        ("dialog_pending", busy.to_string()),
+        ("error", error),
+        ("last_close_reason", close_reason),
+    ]);
+}
+
+/// The sites panel lost the keyboard.  If it went to another app (and not to
+/// one of our dialogs), dismiss the window like the original did when the app
+/// was deactivated.
+fn focus_check() {
+    let Some(mtm) = MainThreadMarker::new() else { return };
+    let ours_still = NSApplication::sharedApplication(mtm).keyWindow().is_some();
+    let (visible, key, sheet) = with_ui(|ui| (ui.sites.is_visible(), ui.sites.is_key(), ui.sites.sheet().is_some()))
+        .unwrap_or((false, true, false));
+    let busy = with_core(|c| c.is_busy()).unwrap_or(true);
+    let menu_open = MENU_OPEN.with(Cell::get);
+    if visible && !key && !sheet && !ours_still && !busy && !menu_open {
+        dispatch(|c, _| c.app_did_resign_active());
+    }
+    update_focus_state();
 }
 
 use super::runloop::{after, main_async};
@@ -142,6 +221,12 @@ fn run_effect(effect: UiEffect) {
         }
         UiEffect::CloseSitesWindow => {
             with_ui(|ui| ui.sites.close());
+            // If the app did get activated (e.g. opened from Finder), give
+            // the keyboard back to the previous app.
+            let app = NSApplication::sharedApplication(mtm);
+            if app.isActive() && !with_ui(|ui| ui.welcome.is_visible()).unwrap_or(false) {
+                app.hide(None);
+            }
         }
         UiEffect::HideApp => NSApplication::sharedApplication(mtm).hide(None),
         UiEffect::Derive(job) => {
@@ -171,7 +256,7 @@ fn run_effect(effect: UiEffect) {
             with_core(|c| c.set_login_item(state));
             if let Some(error) = error {
                 let p = crate::prompt::Prompt::info("Could not change Open at Login", error);
-                dialogs::run_prompt(mtm, &p, None);
+                dialogs::run_prompt(mtm, &p, None, None);
             } else if on && needs_approval {
                 login_item::open_settings();
             }
@@ -185,9 +270,9 @@ fn run_effect(effect: UiEffect) {
             let answer = if mode() == LaunchMode::SmokeTest {
                 smoke::scripted_prompt(mtm, &prompt)
             } else {
-                #[allow(deprecated)]
-                NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
-                dialogs::run_prompt(mtm, &prompt, None)
+                // A sheet on the (key, non-activating) sites panel.
+                let parent = sites_panel_for_sheet();
+                dialogs::run_prompt(mtm, &prompt, parent.as_deref(), None)
             };
             let id = prompt.id;
             dispatch(|c, now| c.prompt_answered(id, answer, now));
@@ -196,9 +281,8 @@ fn run_effect(effect: UiEffect) {
             let path = if mode() == LaunchMode::SmokeTest {
                 smoke::scripted_file(&request)
             } else {
-                #[allow(deprecated)]
-                NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
-                dialogs::run_file_panel(mtm, &request)
+                let parent = sites_panel_for_sheet();
+                dialogs::run_file_panel(mtm, &request, parent.as_deref())
             };
             let id = request.id;
             dispatch(|c, now| c.file_chosen(id, path, now));
@@ -213,6 +297,24 @@ fn run_effect(effect: UiEffect) {
             });
         }
     }
+}
+
+/// Show the sites panel (if needed) and return it as the parent for a sheet;
+/// `None` if a sheet is already attached.
+pub(super) fn sites_panel_for_sheet() -> Option<Retained<objc2_app_kit::NSWindow>> {
+    let visible = with_ui(|ui| ui.sites.is_visible()).unwrap_or(false);
+    if !visible {
+        run_effect(UiEffect::ShowSitesWindow);
+    }
+    with_ui(|ui| {
+        if ui.sites.sheet().is_some() {
+            None
+        } else {
+            let window: &objc2_app_kit::NSWindow = &ui.sites.window;
+            Some(window.retain())
+        }
+    })
+    .flatten()
 }
 
 pub(super) fn rebuild_menu() {
@@ -450,6 +552,7 @@ define_class!(
                 // Save, clear our clipboard secret and keys; the Terminate
                 // effect is ignored (we are already terminating).
                 with_core(|c| drop(c.quit()));
+                super::secure_input::set(false);
                 STATE.with(|s| s.borrow_mut().take());
             });
         }
@@ -474,6 +577,18 @@ define_class!(
         fn menu_needs_update(&self, _menu: &NSMenu) {
             guard("menu", rebuild_menu);
         }
+
+        #[unsafe(method(menuWillOpen:))]
+        fn menu_will_open(&self, _menu: &NSMenu) {
+            MENU_OPEN.with(|m| m.set(true));
+        }
+
+        #[unsafe(method(menuDidClose:))]
+        fn menu_did_close(&self, _menu: &NSMenu) {
+            MENU_OPEN.with(|m| m.set(false));
+            // Re-check once the chosen command (if any) has run.
+            after(Duration::from_millis(400), || guard("focus check", focus_check));
+        }
     }
 
     // SAFETY: method signatures match the protocol.
@@ -494,10 +609,29 @@ define_class!(
                 }
             });
         }
+
+        #[unsafe(method(windowDidBecomeKey:))]
+        fn window_did_become_key(&self, _notification: &NSNotification) {
+            guard("become key", update_focus_state);
+        }
+
+        #[unsafe(method(windowDidResignKey:))]
+        fn window_did_resign_key(&self, _notification: &NSNotification) {
+            guard("resign key", || {
+                update_focus_state();
+                // Decide a moment later: a sheet of ours may be taking over.
+                after(Duration::from_millis(250), || guard("focus check", focus_check));
+            });
+        }
     }
 
     // SAFETY: method signatures match the protocol.
     unsafe impl NSControlTextEditingDelegate for AppDelegate {
+        #[unsafe(method(controlTextDidBeginEditing:))]
+        fn control_text_did_begin_editing(&self, _notification: &NSNotification) {
+            guard("begin editing", update_focus_state);
+        }
+
         #[unsafe(method(controlTextDidChange:))]
         fn control_text_did_change(&self, notification: &NSNotification) {
             guard("text change", || {
@@ -763,6 +897,7 @@ pub(super) fn shutdown() {
         ui.sites.close();
         ui.welcome.close();
     });
+    super::secure_input::set(false);
     // Dropping the core flushes pending saves (SaveQueue's Drop).
     STATE.with(|s| s.borrow_mut().take());
 }

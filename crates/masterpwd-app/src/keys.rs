@@ -187,3 +187,17 @@ mod tests {
         assert!(user.authenticate(&mut copy).is_ok());
     }
 }
+
+/// Live-test helper: prints the v3 long password for `$MPW_NAME`, `$MPW_PASSWORD`,
+/// `$MPW_SITE` (`cargo test -p masterpwd-app -- --ignored print_site_password --nocapture`).
+#[cfg(test)]
+#[test]
+#[ignore]
+fn print_site_password() {
+    let get = |k: &str| std::env::var(k).unwrap_or_default();
+    let key = MasterKey::derive(&get("MPW_NAME"), &get("MPW_PASSWORD"), AlgorithmVersion::V3).unwrap();
+    let pw = key
+        .site_result(&get("MPW_SITE"), 1, mpw_core::KeyPurpose::Authentication, None, mpw_core::ResultType::DEFAULT, None)
+        .unwrap();
+    println!("EXPECTED={}", pw.as_str());
+}

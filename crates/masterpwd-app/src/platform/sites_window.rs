@@ -11,12 +11,12 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSApplication, NSBackingStoreType, NSBorderType, NSButton, NSColor, NSControl, NSEvent, NSEventModifierFlags,
+    NSBackingStoreType, NSBorderType, NSButton, NSColor, NSControl, NSEvent, NSEventModifierFlags,
     NSFont, NSImageScaling, NSImageView, NSPopUpButton, NSProgressIndicator, NSProgressIndicatorStyle, NSResponder,
     NSScrollView, NSSecureTextField, NSSegmentSwitchTracking, NSSegmentedControl, NSStepper, NSTableColumn,
     NSTableView, NSTableViewDataSource, NSTableViewDelegate, NSTableViewStyle, NSTextAlignment, NSTextField,
     NSTextFieldDelegate, NSView, NSWindow, NSWindowCollectionBehavior, NSWindowDelegate, NSWindowSharingType,
-    NSWindowStyleMask,
+    NSWindowStyleMask, NSPanel, NSFloatingWindowLevel,
 };
 use objc2_foundation::{NSArray, NSIndexSet, NSPoint, NSRect, NSSize, NSString};
 
@@ -71,15 +71,27 @@ pub struct SitesWindowIvars {
 }
 
 define_class!(
-    // SAFETY: NSWindow may be subclassed; we only override responder methods
-    // and call super; no Drop impl.
-    #[unsafe(super(NSWindow, NSResponder, objc2_foundation::NSObject))]
+    // SAFETY: NSPanel may be subclassed; we only override responder/key
+    // methods and call super; no Drop impl.
+    //
+    // A *non-activating* panel: it becomes the key window (gets the keyboard)
+    // without activating the app.  macOS no longer lets a background
+    // accessory app activate itself (cooperative activation), so a normal
+    // window summoned by the global hotkey would show up but not get the
+    // keyboard; launcher-style apps all use this kind of panel.
+    #[unsafe(super(NSPanel, NSWindow, NSResponder, objc2_foundation::NSObject))]
     #[thread_kind = MainThreadOnly]
     #[ivars = SitesWindowIvars]
-    #[name = "MPWSitesWindow"]
+    #[name = "MPWSitesPanel"]
     pub struct SitesWindowView;
 
     impl SitesWindowView {
+        // SAFETY: signature matches -[NSWindow canBecomeKeyWindow].
+        #[unsafe(method(canBecomeKeyWindow))]
+        fn can_become_key(&self) -> bool {
+            true
+        }
+
         // SAFETY: signature matches -[NSResponder flagsChanged:].
         #[unsafe(method(flagsChanged:))]
         fn flags_changed(&self, event: &NSEvent) {
@@ -144,6 +156,9 @@ pub struct SitesWindow {
     error: Retained<NSTextField>,
     hint: Retained<NSTextField>,
     last_screen: Cell<Option<Screen>>,
+    /// The tables have been loaded once (they asked for rows before the UI
+    /// existed and cached 0).
+    loaded: Cell<bool>,
     /// True while render() updates controls: ignore the resulting callbacks.
     rendering: Cell<bool>,
     user_rows: RefCell<Vec<UserRow>>,
@@ -283,12 +298,16 @@ impl SitesWindow {
         let window: Retained<SitesWindowView> = unsafe {
             msg_send![super(this),
                 initWithContentRect: rect(0.0, 0.0, W, H),
-                styleMask: NSWindowStyleMask::Titled | NSWindowStyleMask::Closable,
+                styleMask: NSWindowStyleMask::Titled | NSWindowStyleMask::Closable | NSWindowStyleMask::NonactivatingPanel,
                 backing: NSBackingStoreType::Buffered,
                 defer: false]
         };
         // SAFETY: we keep our own strong reference.
         unsafe { window.setReleasedWhenClosed(false) };
+        window.setFloatingPanel(true);
+        window.setLevel(NSFloatingWindowLevel);
+        window.setHidesOnDeactivate(false);
+        window.setBecomesKeyOnlyIfNeeded(false);
         window.setTitle(&ns("Master Password"));
         window.setDelegate(Some(d.window));
         window.setCollectionBehavior(
@@ -466,6 +485,7 @@ impl SitesWindow {
             error,
             hint,
             last_screen: Cell::new(None),
+            loaded: Cell::new(false),
             rendering: Cell::new(false),
             user_rows: RefCell::new(Vec::new()),
             site_rows: RefCell::new(Vec::new()),
@@ -483,17 +503,36 @@ impl SitesWindow {
         self.rendering.get()
     }
 
+    /// Bring the panel to the front and give it the keyboard, without
+    /// activating the app (see [`SitesWindowView`]).
     pub fn show(&self) {
-        #[allow(deprecated)]
-        NSApplication::sharedApplication(self.mtm).activateIgnoringOtherApps(true);
+        self.window.orderFrontRegardless();
         self.window.makeKeyAndOrderFront(None);
+        self.window.makeKeyWindow();
         self.focus();
     }
 
     pub fn close(&self) {
+        if let Some(sheet) = self.window.attachedSheet() {
+            // Ends a pending dialog / file panel (answered as cancelled).
+            self.window.endSheet_returnCode(&sheet, objc2_app_kit::NSModalResponseCancel);
+        }
         if self.window.isVisible() {
             self.window.close();
         }
+    }
+
+    pub fn is_key(&self) -> bool {
+        self.window.isKeyWindow()
+    }
+
+    pub fn sheet(&self) -> Option<Retained<NSWindow>> {
+        self.window.attachedSheet()
+    }
+
+    /// Class of the first responder (debug state).
+    pub fn first_responder_class(&self) -> String {
+        self.window.firstResponder().map_or_else(|| "none".into(), |r| r.class().name().to_string_lossy().into_owned())
     }
 
     pub fn excluded_from_capture(&self) -> bool {
@@ -645,7 +684,8 @@ impl SitesWindow {
 
         // ----- user list
         self.users_scroll.setHidden(unlocked);
-        if *self.user_rows.borrow() != view.users {
+        let first = !self.loaded.replace(true);
+        if first || *self.user_rows.borrow() != view.users {
             *self.user_rows.borrow_mut() = view.users.clone();
             self.users_table.reloadData();
         }
@@ -732,7 +772,7 @@ impl SitesWindow {
             v.setHidden(!unlocked);
         }
         set_text(&self.site, &view.site_query);
-        if *self.site_rows.borrow() != view.candidates {
+        if first || *self.site_rows.borrow() != view.candidates {
             *self.site_rows.borrow_mut() = view.candidates.clone();
             self.sites_table.reloadData();
         }

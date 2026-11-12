@@ -21,6 +21,7 @@ pub enum MenuCommand {
     ExportSecure,
     ExportReveal,
     ShowWelcome,
+    ChangeMasterPassword,
 }
 
 const PARAM_CLIPBOARD: isize = 100_000;
@@ -29,7 +30,7 @@ const PARAM_USER: isize = 300_000;
 const PARAM_SPAN: isize = 100_000;
 
 impl MenuCommand {
-    const SIMPLE: [(MenuCommand, isize); 13] = [
+    const SIMPLE: [(MenuCommand, isize); 14] = [
         (MenuCommand::Open, 1),
         (MenuCommand::Lock, 2),
         (MenuCommand::Quit, 3),
@@ -43,6 +44,7 @@ impl MenuCommand {
         (MenuCommand::ExportSecure, 23),
         (MenuCommand::ExportReveal, 24),
         (MenuCommand::ShowWelcome, 30),
+        (MenuCommand::ChangeMasterPassword, 31),
     ];
 
     /// Encode as an `NSMenuItem` tag (always > 0).

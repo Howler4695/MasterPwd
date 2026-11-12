@@ -5,7 +5,7 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{sel, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSApplication, NSBackingStoreType, NSButton, NSControlStateValueOff, NSControlStateValueOn, NSFont,
+    NSBackingStoreType, NSPanel, NSButton, NSControlStateValueOff, NSControlStateValueOn, NSFont,
     NSImage, NSImageView, NSTextField, NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize};
@@ -30,21 +30,23 @@ fn rect(x: f64, y: f64, w: f64, h: f64) -> NSRect {
 pub struct WelcomeWindow {
     pub window: Retained<NSWindow>,
     open_at_login: Retained<NSButton>,
-    mtm: MainThreadMarker,
 }
 
 impl WelcomeWindow {
     pub fn new(mtm: MainThreadMarker, target: &AnyObject, delegate: &ProtocolObject<dyn NSWindowDelegate>) -> Self {
         // SAFETY: designated initializer with valid arguments.
-        let window = unsafe {
-            NSWindow::initWithContentRect_styleMask_backing_defer(
-                NSWindow::alloc(mtm),
-                rect(0.0, 0.0, 500.0, 330.0),
-                NSWindowStyleMask::Titled | NSWindowStyleMask::Closable,
-                NSBackingStoreType::Buffered,
-                false,
-            )
-        };
+        // A non-activating panel too, so it gets the keyboard even when the
+        // app may not activate itself.
+        let panel = NSPanel::initWithContentRect_styleMask_backing_defer(
+            NSPanel::alloc(mtm),
+            rect(0.0, 0.0, 500.0, 330.0),
+            NSWindowStyleMask::Titled | NSWindowStyleMask::Closable | NSWindowStyleMask::NonactivatingPanel,
+            NSBackingStoreType::Buffered,
+            false,
+        );
+        panel.setHidesOnDeactivate(false);
+        panel.setBecomesKeyOnlyIfNeeded(false);
+        let window: Retained<NSWindow> = Retained::into_super(panel);
         // SAFETY: we hold our own strong reference.
         unsafe { window.setReleasedWhenClosed(false) };
         window.setTitle(&ns("Welcome to Master Password"));
@@ -85,7 +87,7 @@ impl WelcomeWindow {
         done.setKeyEquivalent(&ns("\r"));
         content.addSubview(&done);
 
-        Self { window, open_at_login, mtm }
+        Self { window, open_at_login }
     }
 
     pub fn render(&self, login: &LoginItemState) {
@@ -101,8 +103,7 @@ impl WelcomeWindow {
     }
 
     pub fn show(&self) {
-        #[allow(deprecated)]
-        NSApplication::sharedApplication(self.mtm).activateIgnoringOtherApps(true);
+        self.window.orderFrontRegardless();
         self.window.makeKeyAndOrderFront(None);
     }
 

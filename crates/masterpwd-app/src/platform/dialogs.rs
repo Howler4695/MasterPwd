@@ -1,17 +1,27 @@
 //! Shows [`Prompt`]s as `NSAlert`s and [`FileRequest`]s as open/save panels.
-//! Both run app-modally; the core is not borrowed while they are up.
+//!
+//! When the sites panel is up they run as *sheets* on it: the panel is a
+//! non-activating key window, and a sheet inherits its keyboard focus even
+//! though the app is not active.  Without a parent they run app-modally, with
+//! the alert window made non-activating for the same reason.  Either way the
+//! call blocks (pumping events) until answered; the core is not borrowed
+//! meanwhile.
 
+use std::cell::Cell;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::Duration;
+
+use block2::RcBlock;
 
 use mpw_core::Zeroizing;
 use objc2::rc::Retained;
-use objc2::{MainThreadMarker, MainThreadOnly};
+use objc2::{MainThreadMarker, MainThreadOnly, Message};
 use objc2_app_kit::{
-    NSAlert, NSAlertStyle, NSApplication, NSModalResponseOK, NSOpenPanel, NSSavePanel, NSSecureTextField,
-    NSTextField, NSView,
+    NSAlert, NSAlertStyle, NSApplication, NSEventMask, NSModalResponse, NSModalResponseOK, NSOpenPanel,
+    NSSavePanel, NSSecureTextField, NSTextField, NSView, NSWindow, NSWindowStyleMask,
 };
-use objc2_foundation::{NSArray, NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{NSArray, NSDate, NSDefaultRunLoopMode, NSPoint, NSRect, NSSize, NSString};
 
 use super::ns;
 use crate::prompt::{ButtonRole, FileRequest, Prompt, PromptAnswer, Style};
@@ -27,8 +37,44 @@ pub struct AutoAnswer {
     pub button: usize,
 }
 
-/// Run `prompt` modally.  The secure fields are cleared before returning.
-pub fn run_prompt(mtm: MainThreadMarker, prompt: &Prompt, auto: Option<AutoAnswer>) -> PromptAnswer {
+/// Process events until `done` (a sheet's completion handler ran).
+fn pump_until(mtm: MainThreadMarker, done: &Cell<bool>) {
+    let app = NSApplication::sharedApplication(mtm);
+    while !done.get() {
+        let until = NSDate::dateWithTimeIntervalSinceNow(0.05);
+        // SAFETY: the default run-loop mode is a framework constant; we
+        // dispatch every event we dequeue, like -[NSApplication run].
+        let event = unsafe {
+            app.nextEventMatchingMask_untilDate_inMode_dequeue(NSEventMask::Any, Some(&until), NSDefaultRunLoopMode, true)
+        };
+        if let Some(event) = event {
+            app.sendEvent(&event);
+        }
+    }
+}
+
+type Completion = (Rc<Cell<bool>>, Rc<Cell<NSModalResponse>>, RcBlock<dyn Fn(NSModalResponse)>);
+
+/// A completion handler that records the response and flags `done`.
+fn completion() -> Completion {
+    let done = Rc::new(Cell::new(false));
+    let response = Rc::new(Cell::new(0));
+    let (d, r) = (done.clone(), response.clone());
+    let block = RcBlock::new(move |code: NSModalResponse| {
+        r.set(code);
+        d.set(true);
+    });
+    (done, response, block)
+}
+
+/// Run `prompt` as a sheet on `parent`, or app-modally.  The secure fields
+/// are cleared before returning.
+pub fn run_prompt(
+    mtm: MainThreadMarker,
+    prompt: &Prompt,
+    parent: Option<&NSWindow>,
+    auto: Option<AutoAnswer>,
+) -> PromptAnswer {
     let alert = NSAlert::new(mtm);
     alert.setAlertStyle(match prompt.style {
         Style::Informational => NSAlertStyle::Informational,
@@ -78,16 +124,32 @@ pub fn run_prompt(mtm: MainThreadMarker, prompt: &Prompt, auto: Option<AutoAnswe
         alert.window().setInitialFirstResponder(Some(first));
     }
 
+    let alert_window = alert.window();
     if let Some(auto) = &auto {
         let code = FIRST_BUTTON + auto.button as isize;
-        let window = alert.window();
+        let window = alert_window.clone();
         super::runloop::after(Duration::from_millis(300), move || {
             eprintln!("smoke-test: HOLD dialog window={}", window.windowNumber());
         });
-        super::runloop::after(auto.hold, move || NSApplication::sharedApplication(mtm).stopModalWithCode(code));
+        let (window, parent) = (alert_window.clone(), parent.map(|p| p.retain()));
+        super::runloop::after(auto.hold, move || match parent {
+            Some(parent) => parent.endSheet_returnCode(&window, code),
+            None => NSApplication::sharedApplication(mtm).stopModalWithCode(code),
+        });
     }
 
-    let response = alert.runModal();
+    let response = match parent {
+        Some(parent) => {
+            let (done, response, block) = completion();
+            alert.beginSheetModalForWindow_completionHandler(parent, Some(&block));
+            pump_until(mtm, &done);
+            response.get()
+        }
+        None => {
+            alert_window.setStyleMask(alert_window.styleMask() | NSWindowStyleMask::NonactivatingPanel);
+            alert.runModal()
+        }
+    };
     let button = usize::try_from(response - FIRST_BUTTON).unwrap_or(usize::MAX);
     let values = fields
         .iter()
@@ -100,28 +162,38 @@ pub fn run_prompt(mtm: MainThreadMarker, prompt: &Prompt, auto: Option<AutoAnswe
     PromptAnswer { button, values }
 }
 
-/// Run an open or save panel; `None` if cancelled.
-pub fn run_file_panel(mtm: MainThreadMarker, request: &FileRequest) -> Option<PathBuf> {
+/// Run an open or save panel (as a sheet on `parent` if given); `None` if
+/// cancelled.
+pub fn run_file_panel(mtm: MainThreadMarker, request: &FileRequest, parent: Option<&NSWindow>) -> Option<PathBuf> {
     let types: Vec<Retained<NSString>> = request.extensions.iter().map(|e| ns(e)).collect();
     let types = NSArray::from_retained_slice(&types);
-    #[allow(deprecated)] // setAllowedFileTypes: avoids pulling in UniformTypeIdentifiers
-    let url = if request.save {
+    let panel: Retained<NSSavePanel> = if request.save {
         let panel = NSSavePanel::savePanel(mtm);
-        panel.setTitle(Some(&ns(&request.title)));
-        panel.setMessage(Some(&ns(&request.message)));
         panel.setNameFieldStringValue(&ns(&request.suggested_name));
-        panel.setAllowedFileTypes(Some(&types));
         panel.setCanCreateDirectories(true);
-        (panel.runModal() == NSModalResponseOK).then(|| panel.URL()).flatten()
+        panel
     } else {
         let panel = NSOpenPanel::openPanel(mtm);
-        panel.setTitle(Some(&ns(&request.title)));
-        panel.setMessage(Some(&ns(&request.message)));
-        panel.setAllowedFileTypes(Some(&types));
         panel.setCanChooseDirectories(false);
         panel.setAllowsMultipleSelection(false);
         panel.setPrompt(Some(&ns("Import")));
-        (panel.runModal() == NSModalResponseOK).then(|| panel.URL()).flatten()
+        Retained::into_super(panel)
     };
-    url.and_then(|u| u.path()).map(|p| PathBuf::from(p.to_string()))
+    panel.setTitle(Some(&ns(&request.title)));
+    panel.setMessage(Some(&ns(&request.message)));
+    #[allow(deprecated)] // setAllowedFileTypes: avoids pulling in UniformTypeIdentifiers
+    panel.setAllowedFileTypes(Some(&types));
+    let response = match parent {
+        Some(parent) => {
+            let (done, response, block) = completion();
+            panel.beginSheetModalForWindow_completionHandler(parent, &block);
+            pump_until(mtm, &done);
+            response.get()
+        }
+        None => panel.runModal(),
+    };
+    if response != NSModalResponseOK {
+        return None;
+    }
+    panel.URL().and_then(|u| u.path()).map(|p| PathBuf::from(p.to_string()))
 }

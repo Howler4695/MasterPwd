@@ -42,6 +42,7 @@ const PASSWORD: &str = "banana colored duckling";
 const SITE: &str = "masterpasswordapp.com";
 /// Reference test vector (v3, counter 1, long).
 const EXPECTED: &str = "Jejr5[RepuSosp";
+const NEW_PASSWORD: &str = "a new smoke-test password";
 
 const POLL: Duration = Duration::from_millis(20);
 const MIN_RUNTIME: Duration = Duration::from_secs(2);
@@ -65,6 +66,9 @@ enum Step {
     ExportImport,
     SaveKeys,
     WaitQuickUnlock,
+    ChangePassword,
+    WaitChange,
+    WaitNewUnlock,
     Identicon,
     WaitIdenticon,
     Done,
@@ -165,7 +169,8 @@ pub fn scripted_prompt(mtm: MainThreadMarker, prompt: &Prompt) -> PromptAnswer {
     if let (true, Some(hold)) = (e.show, hold()) {
         log(&format!("HOLD dialog {:?}", prompt.title));
         // Shown for real; dismissed with the scripted button after `hold`.
-        let shown = run_prompt(mtm, prompt, Some(AutoAnswer { hold, button }));
+        let parent = super::app::sites_panel_for_sheet();
+        let shown = run_prompt(mtm, prompt, parent.as_deref(), Some(AutoAnswer { hold, button }));
         if shown.button != button {
             with_smoke(|s| s.failure = Some("the held dialog was answered differently".into()));
         }
@@ -354,6 +359,20 @@ fn run_step(step: Step, step_started: Instant) -> Result<Option<Step>, String> {
             let (visible, excluded) =
                 with_ui(|ui| (ui.sites.is_visible(), ui.sites.excluded_from_capture())).ok_or("no UI")?;
             check(visible, "sites window did not open")?;
+            let (can_key, nonactivating, is_key) = with_ui(|ui| {
+                let w = &ui.sites.window;
+                (
+                    w.canBecomeKeyWindow(),
+                    w.styleMask().contains(objc2_app_kit::NSWindowStyleMask::NonactivatingPanel),
+                    w.isKeyWindow(),
+                )
+            })
+            .ok_or("no UI")?;
+            check(can_key && nonactivating, "the sites window is not a non-activating key panel")?;
+            check(is_key, "the sites window did not become key after show")?;
+            let active = objc2_app_kit::NSApplication::sharedApplication(MainThreadMarker::new().ok_or("not main")?)
+                .isActive();
+            log(&format!("sites panel is key after show (app active: {active})"));
             let allow = std::env::var(sw::ALLOW_CAPTURE_ENV).is_ok_and(|v| v == "1");
             check(excluded != allow, format!("sharingType none = {excluded}, override = {allow}"))?;
             // WindowServer's own view: sharing state 0 = none (not capturable).
@@ -547,8 +566,42 @@ fn run_step(step: Step, step_started: Instant) -> Result<Option<Step>, String> {
             log("unlocked from saved keys after the (stubbed) device-owner check");
             dispatch(|c, now| c.command(MenuCommand::ToggleSavePassword, now));
             check(!Keychain::with_service(&keychain_service()).has_any(NAME), "keys not purged")?;
-            Ok(Some(Step::Identicon))
+            Ok(Some(Step::ChangePassword))
         }
+        Step::ChangePassword => {
+            // Save keys again, so we can check the change purges them.
+            dispatch(|c, now| c.command(MenuCommand::ToggleSavePassword, now));
+            check(Keychain::with_service(&keychain_service()).has_any(NAME), "keys not saved")?;
+            expect("Change", "Change Master Password", &[PASSWORD, NEW_PASSWORD, NEW_PASSWORD], false);
+            expect("was changed", "OK", &[], false);
+            dispatch(|c, now| c.command(MenuCommand::ChangeMasterPassword, now));
+            Ok(Some(Step::WaitChange))
+        }
+        Step::WaitChange => {
+            if with_smoke(|s| s.prompts.is_empty()) != Some(true) {
+                if step_started.elapsed() > Duration::from_secs(10) {
+                    return Err("the change never completed".into());
+                }
+                return Ok(None);
+            }
+            check(!Keychain::with_service(&keychain_service()).has_any(NAME), "saved keys not purged by the change")?;
+            open_window();
+            type_into(sw::TAG_SITE, SITE);
+            let result = with_core(|c| c.vm().result().map(str::to_owned)).flatten();
+            check(result.is_some() && result.as_deref() != Some(EXPECTED), "the password did not change")?;
+            dispatch(|c, now| c.command(MenuCommand::Lock, now));
+            open_window();
+            type_into(sw::TAG_MASTER_PASSWORD, NEW_PASSWORD);
+            check(text_command(sw::TAG_MASTER_PASSWORD, sel!(insertNewline:)), "⏎ not handled")?;
+            Ok(Some(Step::WaitNewUnlock))
+        }
+        Step::WaitNewUnlock => match wait_for(Screen::Unlocked)? {
+            None => Ok(None),
+            Some(()) => {
+                log("unlocked with the new master password after reload from disk");
+                Ok(Some(Step::Identicon))
+            }
+        },
         Step::Identicon => {
             dispatch(|c, now| c.command(MenuCommand::Lock, now));
             open_window();
