@@ -98,6 +98,8 @@ password is wiped as soon as the keys exist.
 | Entitlements include outgoing network access and an app group. | App Sandbox with user-selected file access only; hardened runtime. |
 | Bundles Font Awesome Pro fonts. | Not carried over (paid licence); system fonts and SF Symbols are used. |
 | Intel-only binary. | Native arm64 (universal when an x86_64 Rust target is installed). |
+| Full-screen mode uses a screensaver-level window, which sits above every system prompt. | Full screen (still the default) sits just above the menu bar and Dock, and drops back to a normal window while a Touch ID or smart card PIN prompt is in progress, so it can never cover one. |
+| In full screen, clicking outside the content does nothing. | Clicking the backdrop closes the window, like Esc. |
 
 ## New: smart card second factor
 

@@ -16,7 +16,9 @@ use objc2_app_kit::{
     NSScrollView, NSSecureTextField, NSSegmentSwitchTracking, NSSegmentedControl, NSStepper, NSTableColumn,
     NSTableView, NSTableViewDataSource, NSTableViewDelegate, NSTableViewStyle, NSTextAlignment, NSTextField,
     NSTextFieldDelegate, NSView, NSWindow, NSWindowCollectionBehavior, NSWindowDelegate, NSWindowSharingType,
-    NSWindowStyleMask, NSPanel, NSFloatingWindowLevel,
+    NSWindowStyleMask, NSPanel, NSFloatingWindowLevel, NSAutoresizingMaskOptions, NSBox, NSBoxType, NSScreen,
+    NSStatusWindowLevel, NSTitlePosition, NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState,
+    NSVisualEffectView, NSWorkspace,
 };
 use objc2_foundation::{NSArray, NSIndexSet, NSPoint, NSRect, NSSize, NSString};
 
@@ -111,6 +113,56 @@ define_class!(
     }
 );
 
+pub struct BackdropIvars {
+    on_click: CancelCallback,
+}
+
+define_class!(
+    // SAFETY: NSVisualEffectView may be subclassed; we only override mouse
+    // handling; no Drop impl.
+    //
+    // The full-screen backdrop: a behind-window blur (composited by the
+    // window server; we never capture the screen) that dismisses the window
+    // when clicked, like Esc.
+    #[unsafe(super(NSVisualEffectView, NSView, NSResponder, objc2_foundation::NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[ivars = BackdropIvars]
+    #[name = "MPWBackdropView"]
+    pub struct BackdropView;
+
+    impl BackdropView {
+        // SAFETY: signature matches -[NSResponder mouseDown:].
+        #[unsafe(method(mouseDown:))]
+        fn mouse_down(&self, _event: &NSEvent) {
+            (self.ivars().on_click)();
+        }
+
+        // SAFETY: signature matches -[NSView acceptsFirstMouse:].
+        #[unsafe(method(acceptsFirstMouse:))]
+        fn accepts_first_mouse(&self, _event: Option<&NSEvent>) -> bool {
+            true
+        }
+    }
+);
+
+/// Content size of the windowed sites window (and of the centred card in
+/// full-screen mode).
+pub const CARD: NSSize = NSSize::new(W, H);
+
+/// The screen under the mouse pointer (what a hotkey user looks at), else the
+/// main screen.
+pub fn mouse_screen(mtm: MainThreadMarker) -> Option<Retained<NSScreen>> {
+    let p = NSEvent::mouseLocation();
+    let screens = NSScreen::screens(mtm);
+    screens
+        .iter()
+        .find(|s| {
+            let f = s.frame();
+            p.x >= f.origin.x && p.x < f.origin.x + f.size.width && p.y >= f.origin.y && p.y < f.origin.y + f.size.height
+        })
+        .or_else(|| NSScreen::mainScreen(mtm))
+}
+
 /// Is ⇧ held right now?
 pub fn shift_down() -> bool {
     NSEvent::modifierFlags_class().contains(NSEventModifierFlags::Shift)
@@ -163,6 +215,11 @@ pub struct SitesWindow {
     error: Retained<NSTextField>,
     hint: Retained<NSTextField>,
     last_screen: Cell<Option<Screen>>,
+    /// The fixed-size card holding every control.
+    card: Retained<NSVisualEffectView>,
+    backdrop: Retained<BackdropView>,
+    dim: Retained<NSBox>,
+    full_screen: Cell<bool>,
     /// The tables have been loaded once (they asked for rows before the UI
     /// existed and cached 0).
     loaded: Cell<bool>,
@@ -324,7 +381,29 @@ impl SitesWindow {
         window.setSharingType(if allow_capture { NSWindowSharingType::ReadOnly } else { NSWindowSharingType::None });
         window.center();
         let content = window.contentView().expect("a titled window has a content view");
-        let add = |v: &NSView| content.addSubview(v);
+        // Full-screen backdrop (hidden when windowed), then the card.
+        let backdrop = BackdropView::alloc(mtm).set_ivars(BackdropIvars { on_click: on_cancel });
+        // SAFETY: NSView's designated initializer.
+        let backdrop: Retained<BackdropView> = unsafe { msg_send![super(backdrop), initWithFrame: rect(0.0, 0.0, W, H)] };
+        backdrop.setMaterial(NSVisualEffectMaterial::FullScreenUI);
+        backdrop.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
+        backdrop.setState(NSVisualEffectState::Active);
+        backdrop.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable);
+        backdrop.setHidden(true);
+        let dim = NSBox::initWithFrame(NSBox::alloc(mtm), rect(0.0, 0.0, W, H));
+        dim.setBoxType(NSBoxType::Custom);
+        dim.setBorderWidth(0.0);
+        dim.setTitlePosition(NSTitlePosition::NoTitle);
+        dim.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable);
+        backdrop.addSubview(&dim);
+        content.addSubview(&backdrop);
+        let card = NSVisualEffectView::initWithFrame(NSVisualEffectView::alloc(mtm), rect(0.0, 0.0, W, H));
+        card.setMaterial(NSVisualEffectMaterial::WindowBackground);
+        card.setBlendingMode(NSVisualEffectBlendingMode::WithinWindow);
+        card.setState(NSVisualEffectState::Active);
+        card.setWantsLayer(true);
+        content.addSubview(&card);
+        let add = |v: &NSView| card.addSubview(v);
         let t = d.target;
 
         let prompt = label(mtm, "", rect(20.0, 466.0, 600.0, 22.0), 15.0);
@@ -508,6 +587,10 @@ impl SitesWindow {
             error,
             hint,
             last_screen: Cell::new(None),
+            card,
+            backdrop,
+            dim,
+            full_screen: Cell::new(false),
             loaded: Cell::new(false),
             rendering: Cell::new(false),
             user_rows: RefCell::new(Vec::new()),
@@ -524,6 +607,85 @@ impl SitesWindow {
 
     pub fn is_rendering(&self) -> bool {
         self.rendering.get()
+    }
+
+    pub fn is_full_screen(&self) -> bool {
+        self.full_screen.get()
+    }
+
+    /// The card's frame in window coordinates (sheets are positioned on it).
+    pub fn card_frame(&self) -> NSRect {
+        self.card.frame()
+    }
+
+    /// Present full screen (on the screen under the mouse) or windowed.  Safe
+    /// to call repeatedly; re-applies the frame (screen changes).
+    ///
+    /// Full screen: borderless, still non-activating, at `NSStatusWindowLevel`
+    /// (25) — above the menu bar (24) and the Dock (20) so the whole screen is
+    /// covered, but below pop-up menus (101) so our own status menu still
+    /// opens over it, and far below the screen saver level (1000) the original
+    /// used.  The window server blurs what is behind the backdrop; we never
+    /// read the screen.
+    pub fn present(&self, full_screen: bool) {
+        let w = &self.window;
+        if full_screen {
+            let screen = w.screen().filter(|_| self.full_screen.get() && w.isVisible()).or_else(|| mouse_screen(self.mtm));
+            let Some(screen) = screen else { return };
+            let frame = screen.frame();
+            w.setStyleMask(NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel);
+            w.setOpaque(false);
+            w.setBackgroundColor(Some(&NSColor::clearColor()));
+            w.setHasShadow(false);
+            w.setLevel(NSStatusWindowLevel);
+            w.setFrame_display(frame, true);
+            let reduce = NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceTransparency();
+            // Opaque backdrop when "Reduce transparency" is on.
+            self.dim.setFillColor(&*if reduce {
+                NSColor::windowBackgroundColor()
+            } else {
+                NSColor::colorWithWhite_alpha(0.0, 0.35)
+            });
+            self.backdrop.setFrame(rect(0.0, 0.0, frame.size.width, frame.size.height));
+            self.backdrop.setHidden(false);
+            self.card.setFrame(rect(
+                ((frame.size.width - W) / 2.0).round(),
+                ((frame.size.height - H) / 2.0).round(),
+                W,
+                H,
+            ));
+            if let Some(layer) = self.card.layer() {
+                layer.setCornerRadius(14.0);
+                layer.setMasksToBounds(true);
+            }
+        } else {
+            let was_full = self.full_screen.get();
+            w.setStyleMask(
+                NSWindowStyleMask::Titled | NSWindowStyleMask::Closable | NSWindowStyleMask::NonactivatingPanel,
+            );
+            w.setOpaque(true);
+            w.setBackgroundColor(Some(&NSColor::windowBackgroundColor()));
+            w.setHasShadow(true);
+            w.setLevel(NSFloatingWindowLevel);
+            self.backdrop.setHidden(true);
+            if was_full || w.contentView().is_some_and(|c| c.frame().size != CARD) {
+                w.setContentSize(CARD);
+                if let Some(screen) = mouse_screen(self.mtm) {
+                    // Centre on the screen under the mouse.
+                    let f = w.frame();
+                    let v = screen.visibleFrame();
+                    w.setFrameOrigin(NSPoint::new(
+                        (v.origin.x + (v.size.width - f.size.width) / 2.0).round(),
+                        (v.origin.y + (v.size.height - f.size.height) / 2.0).round(),
+                    ));
+                }
+            }
+            self.card.setFrame(rect(0.0, 0.0, W, H));
+            if let Some(layer) = self.card.layer() {
+                layer.setCornerRadius(0.0);
+            }
+        }
+        self.full_screen.set(full_screen);
     }
 
     /// Bring the panel to the front and give it the keyboard, without

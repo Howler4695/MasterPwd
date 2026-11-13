@@ -21,6 +21,7 @@ pub const KEY_IDLE_LOCK_MINUTES: &str = "idleLockMinutes";
 pub const KEY_WELCOME_SHOWN: &str = "welcomeShown";
 pub const KEY_LAST_FULL_NAME: &str = "lastFullName";
 pub const KEY_LOCK_ON_CARD_REMOVAL: &str = "lockOnCardRemoval";
+pub const KEY_SHOW_FULL_SCREEN: &str = "showFullScreen";
 
 /// Choices offered in the menu.  0 = never.
 pub const CLIPBOARD_CLEAR_CHOICES: [u32; 5] = [15, 30, 60, 120, 0];
@@ -42,6 +43,9 @@ pub struct Preferences {
     pub last_full_name: Option<String>,
     /// Lock as soon as the smart card that unlocked the user is removed.
     pub lock_on_card_removal: bool,
+    /// Present the sites window over the whole screen (the original's
+    /// "Show Full Screen"; its default was on).
+    pub show_full_screen: bool,
 }
 
 impl Default for Preferences {
@@ -54,6 +58,7 @@ impl Default for Preferences {
             welcome_shown: false,
             last_full_name: None,
             lock_on_card_removal: true,
+            show_full_screen: true,
         }
     }
 }
@@ -80,6 +85,7 @@ impl Preferences {
                 .get_string(KEY_LAST_FULL_NAME)
                 .filter(|s| !s.trim().is_empty() && s.len() < 1024),
             lock_on_card_removal: store.get_bool(KEY_LOCK_ON_CARD_REMOVAL).unwrap_or(d.lock_on_card_removal),
+            show_full_screen: store.get_bool(KEY_SHOW_FULL_SCREEN).unwrap_or(d.show_full_screen),
         }
     }
 
@@ -91,6 +97,7 @@ impl Preferences {
         store.set_bool(KEY_WELCOME_SHOWN, self.welcome_shown);
         store.set_string(KEY_LAST_FULL_NAME, self.last_full_name.as_deref());
         store.set_bool(KEY_LOCK_ON_CARD_REMOVAL, self.lock_on_card_removal);
+        store.set_bool(KEY_SHOW_FULL_SCREEN, self.show_full_screen);
     }
 
     pub fn clipboard_timeout(&self) -> Option<Duration> {
@@ -145,6 +152,7 @@ mod tests {
         assert_eq!(p.clipboard_timeout(), Some(Duration::from_secs(60)));
         assert_eq!(p.idle_timeout(), Some(Duration::from_secs(15 * 60)));
         assert!(!p.remember_password);
+        assert!(p.show_full_screen, "the original's default");
     }
 
     #[test]
@@ -158,6 +166,7 @@ mod tests {
             welcome_shown: true,
             last_full_name: Some("Robert Lee Mitchell".into()),
             lock_on_card_removal: false,
+            show_full_screen: false,
         };
         p.save(&mut store);
         let loaded = Preferences::load(&store);

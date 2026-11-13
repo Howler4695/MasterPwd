@@ -853,6 +853,11 @@ impl AppCore {
         Vec::new()
     }
 
+    /// A card unwrap (system PIN dialog) is running.
+    pub(crate) fn unwrap_in_flight(&self) -> bool {
+        self.sf.works.values().any(|w| matches!(w, WorkPurpose::Secret | WorkPurpose::Verify { .. }))
+    }
+
     pub(crate) fn sf_reset(&mut self) {
         let tokens = std::mem::take(&mut self.sf.tokens);
         self.sf = SfState { tokens, ..SfState::default() };

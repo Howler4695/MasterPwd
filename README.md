@@ -23,6 +23,8 @@ security issues found in the original along the way — see
 A menu-bar app (no Dock icon).
 
 - **⌃⌘P** opens the sites window from anywhere; **⌃⌥⌘P** locks.
+- The window covers the whole screen, like the original; turn off
+  *Preferences ▸ Show Full Screen* for a regular window.
 - Pick your user (or create one), type your master password, type a site
   name, press **⏎** to copy the password. **⇧⏎** copies the login name.
 - Per site: password type (including your own stored passwords), counter,

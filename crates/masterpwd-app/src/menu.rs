@@ -27,6 +27,7 @@ pub enum MenuCommand {
     RotateRecoveryCode,
     DisableSecondFactor,
     ToggleLockOnCardRemoval,
+    ToggleFullScreen,
     /// Index into the unlocked user's second-factor slots.
     RemoveSlot(u32),
 }
@@ -38,7 +39,7 @@ const PARAM_SLOT: isize = 400_000;
 const PARAM_SPAN: isize = 100_000;
 
 impl MenuCommand {
-    const SIMPLE: [(MenuCommand, isize); 19] = [
+    const SIMPLE: [(MenuCommand, isize); 20] = [
         (MenuCommand::Open, 1),
         (MenuCommand::Lock, 2),
         (MenuCommand::Quit, 3),
@@ -58,6 +59,7 @@ impl MenuCommand {
         (MenuCommand::RotateRecoveryCode, 42),
         (MenuCommand::DisableSecondFactor, 43),
         (MenuCommand::ToggleLockOnCardRemoval, 44),
+        (MenuCommand::ToggleFullScreen, 32),
     ];
 
     /// Encode as an `NSMenuItem` tag (always > 0).

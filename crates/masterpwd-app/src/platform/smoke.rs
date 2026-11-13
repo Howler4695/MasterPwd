@@ -172,6 +172,68 @@ fn card_pulled() -> bool {
     CARD_PRESENCE.with(|p| p.borrow().as_ref().is_some_and(|p| !p.load(std::sync::atomic::Ordering::SeqCst)))
 }
 
+/// Full screen (the default): the panel covers its screen, stays a key
+/// non-activating panel; switching the preference off restores the window.
+fn full_screen_checks() -> Result<(), String> {
+    let state = || {
+        with_ui(|ui| {
+            let w = &ui.sites.window;
+            let screen = w.screen().map(|s| s.frame());
+            let content = w.contentView().map(|c| c.frame().size);
+            (
+                ui.sites.is_full_screen(),
+                w.frame(),
+                screen,
+                content,
+                w.isKeyWindow(),
+                w.styleMask().contains(objc2_app_kit::NSWindowStyleMask::NonactivatingPanel),
+                w.level(),
+            )
+        })
+    };
+    let (full, frame, screen, _, key, nonactivating, level) = state().ok_or("no UI")?;
+    check(full, "full screen is not the default")?;
+    check(Some(frame) == screen, format!("full-screen frame {frame:?} != screen {screen:?}"))?;
+    check(key && nonactivating, format!("full screen: key {key}, non-activating {nonactivating}"))?;
+    check(level == objc2_app_kit::NSStatusWindowLevel, format!("full-screen level {level}"))?;
+    log(&format!("full screen: frame = screen frame {frame:?}, key, non-activating, level {level}"));
+
+    dispatch(|c, now| c.command(MenuCommand::ToggleFullScreen, now));
+    let (full, frame, _, content, key, nonactivating, level) = state().ok_or("no UI")?;
+    check(!full && content == Some(sw::CARD), format!("windowed: full {full}, content {content:?}"))?;
+    check(key && nonactivating, format!("windowed: key {key}, non-activating {nonactivating}"))?;
+    log(&format!("preference off: windowed again, frame {frame:?}, level {level}"));
+
+    dispatch(|c, now| c.command(MenuCommand::ToggleFullScreen, now));
+    let (full, frame, screen, _, key, _, _) = state().ok_or("no UI")?;
+    check(full && Some(frame) == screen && key, "preference back on: not full screen / not key")?;
+
+    // A real mouse-down on the backdrop (top-left corner, outside the card),
+    // through the window's own event dispatch: hit-testing and the responder
+    // chain as for a user's click.  It must dismiss the window like Esc.
+    let corner = objc2_foundation::NSPoint::new(40.0, frame.size.height - 40.0);
+    let event = with_ui(|ui| {
+        objc2_app_kit::NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
+            objc2_app_kit::NSEventType::LeftMouseDown,
+            corner,
+            objc2_app_kit::NSEventModifierFlags::empty(),
+            0.0,
+            ui.sites.window.windowNumber(),
+            None,
+            0,
+            1,
+            1.0,
+        )
+    })
+    .flatten()
+    .ok_or("could not make a mouse event")?;
+    with_ui(|ui| ui.sites.window.sendEvent(&event));
+    check(!with_ui(|ui| ui.sites.is_visible()).unwrap_or(true), "a click on the backdrop did not dismiss the window")?;
+    log("a click on the full-screen backdrop dismissed the window");
+    open_window();
+    Ok(())
+}
+
 /// Wait for a second-factor unlock to finish.
 fn wait_for_unlock(started: Instant) -> Result<Option<()>, String> {
     match screen() {
@@ -448,6 +510,7 @@ fn run_step(step: Step, step_started: Instant) -> Result<Option<Step>, String> {
             let active = objc2_app_kit::NSApplication::sharedApplication(MainThreadMarker::new().ok_or("not main")?)
                 .isActive();
             log(&format!("sites panel is key after show (app active: {active})"));
+            full_screen_checks()?;
             let allow = std::env::var(sw::ALLOW_CAPTURE_ENV).is_ok_and(|v| v == "1");
             check(excluded != allow, format!("sharingType none = {excluded}, override = {allow}"))?;
             // WindowServer's own view: sharing state 0 = none (not capturable).

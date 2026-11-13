@@ -113,10 +113,17 @@ pub(super) fn dispatch(f: impl FnOnce(&mut Core, Instant) -> Vec<UiEffect>) {
 }
 
 pub(super) fn render() {
-    let Some((view, screen, login)) = with_core(|c| (c.vm().view(), c.vm().screen(), c.login_item().clone())) else {
+    let Some((view, screen, login, presentation)) =
+        with_core(|c| (c.vm().view(), c.vm().screen(), c.login_item().clone(), c.presentation()))
+    else {
         return;
     };
     with_ui(|ui| {
+        // Full screen ⇄ windowed: the preference changed, or a system
+        // authentication prompt started / ended.
+        if ui.sites.is_visible() && ui.sites.is_full_screen() != presentation.full_screen {
+            ui.sites.present(presentation.full_screen);
+        }
         ui.sites.render(&view);
         ui.status.set_locked(screen != Screen::Unlocked);
         ui.welcome.render(&login);
@@ -182,7 +189,15 @@ pub(super) fn update_focus_state() {
         ("error", error),
         ("last_close_reason", close_reason),
         ("menu_open", MENU_OPEN.with(Cell::get).to_string()),
+        ("full_screen", with_ui(|ui| ui.sites.is_full_screen()).unwrap_or(false).to_string()),
+        ("window_frame", with_ui(|ui| fmt_rect(ui.sites.window.frame())).unwrap_or_default()),
+        ("screen_frame", with_ui(|ui| ui.sites.window.screen().map(|s| fmt_rect(s.frame()))).flatten().unwrap_or_default()),
+        ("window_level", with_ui(|ui| ui.sites.window.level().to_string()).unwrap_or_default()),
     ]);
+}
+
+fn fmt_rect(r: objc2_foundation::NSRect) -> String {
+    format!("{},{},{},{}", r.origin.x, r.origin.y, r.size.width, r.size.height)
 }
 
 /// The sites panel lost the keyboard.  If it went to another app (and not to
@@ -214,6 +229,9 @@ fn run_effect(effect: UiEffect) {
     match effect {
         UiEffect::ShowSitesWindow => {
             let was_visible = with_ui(|ui| ui.sites.is_visible()).unwrap_or(true);
+            if let Some(p) = with_core(|c| c.presentation()) {
+                with_ui(|ui| ui.sites.present(p.full_screen));
+            }
             if !was_visible {
                 with_core(|c| c.window_did_show(Instant::now()));
                 render();
@@ -575,6 +593,20 @@ define_class!(
             });
         }
 
+        #[unsafe(method(applicationDidChangeScreenParameters:))]
+        fn screen_parameters_changed(&self, _notification: &NSNotification) {
+            // A display was unplugged / resolution changed: re-fit the
+            // full-screen panel to its (possibly new) screen.
+            guard("screens", || {
+                with_ui(|ui| {
+                    if ui.sites.is_visible() && ui.sites.is_full_screen() {
+                        ui.sites.present(true);
+                    }
+                });
+                update_focus_state();
+            });
+        }
+
         #[unsafe(method(application:openURLs:))]
         fn open_urls(&self, _application: &NSApplication, urls: &NSArray<NSURL>) {
             let paths: Vec<PathBuf> =
@@ -628,6 +660,30 @@ define_class!(
                     });
                 }
             });
+        }
+
+        #[unsafe(method(window:willPositionSheet:usingRect:))]
+        fn will_position_sheet(
+            &self,
+            window: &objc2_app_kit::NSWindow,
+            _sheet: &objc2_app_kit::NSWindow,
+            rect: objc2_foundation::NSRect,
+        ) -> objc2_foundation::NSRect {
+            // Full screen: sheets drop from the top of the centred card, not
+            // from the top edge of the screen.
+            with_ui(|ui| {
+                let ours = std::ptr::eq(window as *const _ as *const AnyObject, &*ui.sites.window as *const _ as *const AnyObject);
+                if ours && ui.sites.is_full_screen() {
+                    let card = ui.sites.card_frame();
+                    objc2_foundation::NSRect::new(
+                        objc2_foundation::NSPoint::new(card.origin.x, card.origin.y + card.size.height),
+                        objc2_foundation::NSSize::new(card.size.width, 0.0),
+                    )
+                } else {
+                    rect
+                }
+            })
+            .unwrap_or(rect)
         }
 
         #[unsafe(method(windowDidBecomeKey:))]

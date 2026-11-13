@@ -97,6 +97,14 @@ pub enum SystemEvent {
     SessionResignedActive,
 }
 
+/// How the sites window is shown (see [`AppCore::presentation`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Presentation {
+    pub full_screen: bool,
+    /// A system authentication prompt may be up.
+    pub system_prompt: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoginItemState {
     Unavailable(String),
@@ -451,6 +459,15 @@ impl AppCore {
         } else {
             Vec::new()
         }
+    }
+
+    /// How to present the sites window.  Full screen per the preference, but
+    /// windowed while a system authentication prompt we triggered (smart card
+    /// PIN, Touch ID / account password) may be on screen: those prompts must
+    /// never end up underneath a screen-covering panel.
+    pub fn presentation(&self) -> Presentation {
+        let system_prompt = self.device_auth.is_some() || self.unwrap_in_flight();
+        Presentation { full_screen: self.prefs.show_full_screen && !system_prompt, system_prompt }
     }
 
     /// Whether a dialog, file panel or Touch ID prompt of ours is pending.
@@ -1217,6 +1234,11 @@ impl AppCore {
             MenuCommand::RotateRecoveryCode => self.sf_rotate(),
             MenuCommand::DisableSecondFactor => self.sf_disable(),
             MenuCommand::RemoveSlot(i) => self.sf_remove_slot(i as usize),
+            MenuCommand::ToggleFullScreen => {
+                self.prefs.show_full_screen = !self.prefs.show_full_screen;
+                self.save_prefs();
+                Vec::new()
+            }
             MenuCommand::ToggleLockOnCardRemoval => {
                 self.prefs.lock_on_card_removal = !self.prefs.lock_on_card_removal;
                 self.save_prefs();
@@ -1424,6 +1446,10 @@ impl AppCore {
                 MenuItem::new("Hide Passwords", MenuCommand::ToggleHidePasswords)
                     .checked(self.prefs.hide_passwords)
                     .tooltip("Don't display the password.  Hold ⌥ to reveal temporarily.")
+                    .into(),
+                MenuItem::new("Show Full Screen", MenuCommand::ToggleFullScreen)
+                    .checked(self.prefs.show_full_screen)
+                    .tooltip("Claim the entire screen while looking up passwords.")
                     .into(),
                 MenuItem::new("Remember Password", MenuCommand::ToggleRememberPassword)
                     .checked(self.prefs.remember_password)
@@ -2149,6 +2175,37 @@ mod tests {
             settle(&mut r, effects);
             assert!(r.core.vm().is_unlocked(), "{:?}", r.core.vm().error());
         }
+    }
+
+    #[test]
+    fn full_screen_preference_and_presentation() {
+        let mut r = rig(MemoryPrefs::default());
+        let item = find(&r.core.menu(), MenuCommand::ToggleFullScreen).unwrap().clone();
+        assert_eq!(item.title, "Show Full Screen");
+        assert_eq!(item.tooltip.as_deref(), Some("Claim the entire screen while looking up passwords."));
+        assert!(item.checked, "on by default, like the original");
+        assert!(r.core.presentation().full_screen);
+        r.core.command(MenuCommand::ToggleFullScreen, r.now);
+        assert!(!r.core.presentation().full_screen);
+        assert!(!find(&r.core.menu(), MenuCommand::ToggleFullScreen).unwrap().checked);
+        r.core.command(MenuCommand::ToggleFullScreen, r.now);
+        // A Touch ID prompt in flight: windowed so the system prompt is never covered.
+        create(&mut r, NAME, PASSWORD);
+        r.core.command(MenuCommand::ToggleSavePassword, r.now);
+        r.core.command(MenuCommand::Lock, r.now);
+        let effects = r.core.quick_unlock();
+        assert!(matches!(effects.as_slice(), [UiEffect::DeviceAuth { .. }]));
+        let p = r.core.presentation();
+        assert!(!p.full_screen && p.system_prompt);
+    }
+
+    #[test]
+    fn full_screen_preference_persists() {
+        let mut store = MemoryPrefs::default();
+        let mut prefs = Preferences::load(&store);
+        prefs.show_full_screen = false;
+        prefs.save(&mut store);
+        assert!(!Preferences::load(&store).show_full_screen);
     }
 
     #[test]

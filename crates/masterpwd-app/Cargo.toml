@@ -68,14 +68,20 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
     "NSUserDefaults",
     "NSValue",
 ] }
+objc2-quartz-core = { version = "0.3", default-features = false, features = ["std", "CALayer", "objc2-core-foundation"] }
 objc2-app-kit = { version = "0.3", default-features = false, features = [
     "std",
     "block2",
+    "objc2-quartz-core",
+    "NSAccessibility",
+    "NSBox",
+    "NSVisualEffectView",
     "objc2-core-foundation",
     "NSAccessibilityProtocols",
     "NSAlert",
     "NSClipView",
     "NSFontDescriptor",
+    "NSGraphicsContext",
     "NSImageCell",
     "NSImageView",
     "NSOpenPanel",
