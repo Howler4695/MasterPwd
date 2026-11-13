@@ -55,7 +55,7 @@ master password, insert the card and enter its PIN in the macOS prompt.
 - **Enabling it changes every generated password**, like changing your master
   password. Stored personal passwords are re-encrypted.
 - Write the recovery code down. If the card is lost, expires or is reissued,
-  unlock with the code and enrol the new card. The code also works in any
+  unlock with the code and enroll the new card. The code also works in any
   other Master Password app and in `mpw`: type your master password, a space
   and the code.
 - Only a fingerprint of the certificate and a generic label are stored — not
